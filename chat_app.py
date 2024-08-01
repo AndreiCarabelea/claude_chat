@@ -8,6 +8,8 @@ from record import record_audio
 import whisper_timestamped as whisper
 from langdetect import detect
 
+#second change
+
 client = Anthropic()
 MODEL_NAME = ["claude-3-5-sonnet-20240620", "claude-3-haiku-20240307"][1]
 
