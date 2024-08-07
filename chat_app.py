@@ -7,11 +7,12 @@ import random
 from record import record_audio
 import whisper_timestamped as whisper
 from langdetect import detect
+import re 
 
 #second change
 
 client = Anthropic()
-MODEL_NAME = ["claude-3-5-sonnet-20240620", "claude-3-haiku-20240307"][1]
+MODEL_NAME = ["claude-3-5-sonnet-20240620", "claude-3-haiku-20240307"][0]
 
 book_name= "A-First-Course-in-Probability-8th-ed.-Sheldon-Ross.pdf"
 reader = PdfReader(book_name)
@@ -23,6 +24,28 @@ number_of_chunks = 10
 chunk_size = len(pdf_text)//number_of_chunks
 message_history = []
 
+
+def extract_number(text):
+    """
+    Extracts a single integer number from the given text.
+    
+    Parameters:
+    text (str): The input text containing a single integer number.
+    
+    Returns:
+    int: The extracted integer number.
+    None: If no integer number is found in the text.
+    """
+    # Use regular expression to find the first occurrence of an integer
+    match = re.search(r'\b\d+\b', text)
+    
+    if match:
+        # Convert the matched string to an integer and return it
+        return int(match.group())
+    else:
+        # Return None if no integer is found
+        return None
+    
 
 def getLanguage(phrase):
     
@@ -41,28 +64,16 @@ def getLanguage(phrase):
 
 
 
-def  chunk_generator():
-    start = - chunk_size
-    for _ in range(number_of_chunks):
-        start = start + chunk_size
-        # print((start, start + chunk_size - 1))
-        yield pdf_text[start: start+chunk_size]
-
-@lru_cache
-def chunk_getter(index, book_name):
-    
-    if index < 0 or (index + 1) > number_of_chunks:
-        return ""
-    
-    for local_i, text_chunk in enumerate(chunk_generator()):
-        if index == local_i:
-            return text_chunk
+def chunk_getter(index, book_name):    
+    return pdf_text[index  * chunk_size : index  * chunk_size + chunk_size]
     
     
     
 def get_completion_pdf(client, simple_prompt, page_number: int, chunk_width):
     global book_name, message_history
     print((page_number, chunk_width))
+    
+    #0 based
     chunk_index = floor((page_number * number_of_chunks/number_of_pages))
     
     text_chunk = ""
@@ -179,15 +190,40 @@ if __name__ == "__main__":
                 result = whisper.transcribe(whisper_model, audio, language=native_language)
                 simple_prompt = result["text"]
                 
+                while True:
+                    page_number = None
+                    print("Say: the information is on page ... ")
+                    record_audio("recording.wav")
+                    audio = whisper.load_audio("recording.wav")
+                    result = whisper.transcribe(whisper_model, audio, language=native_language)
+                    
+                    try:
+                        page_number = float(extract_number(result["text"]))
+                    except:
+                        print(page_number)
+                        break
+                    
+                    
+                    if page_number > 1.1 * number_of_pages:
+                        print(page_number)
+                        continue
+                    else:
+                        break
+                    
                 
-                print("Enter page number from pdf")
-                record_audio("recording.wav")
-                audio = whisper.load_audio("recording.wav")
-                result = whisper.transcribe(whisper_model, audio, language=native_language)
-                page_number = float(result["text"])
                 
                 
                 print(f"{simple_prompt} - {page_number}")
+                junk_text = input("text/page ok ?")
+                if "y" not in junk_text:
+                    continue
+                
+                
+                if page_number  is None:
+                    system_response = get_system_response(client, simple_prompt)
+                    message_history.append({ 'role': 'assistant', 'content':  simple_prompt})
+                    print(system_response)
+                    continue
                 
                 try:
                     explanation = find_section_and_respond(client, simple_prompt, page_number, 1)
