@@ -8,13 +8,14 @@ from record import record_audio
 import whisper_timestamped as whisper
 from langdetect import detect
 import re 
+from prompt import get_long_prompt
 
 #second change
 
 client = Anthropic()
 MODEL_NAME = ["claude-3-5-sonnet-20240620", "claude-3-haiku-20240307"][0]
 
-book_name= "A-First-Course-in-Probability-8th-ed.-Sheldon-Ross.pdf"
+book_name= "2008-rfs.pdf"
 reader = PdfReader(book_name)
 number_of_pages = len(reader.pages)
 
@@ -139,28 +140,41 @@ if __name__ == "__main__":
             print(enter_mode)
             continue
         
-        if enter_mode == 1 or enter_mode == 3:
+        if enter_mode == 1 or enter_mode == 3 or enter_mode == 4:
             # language_text = input("Put some text in your language")
             # native_language = getLanguage(language_text)
             native_language = "en"
              
         while True:
             
-             
+            #todo ask questions about response 
             if enter_mode == 2:
                 simple_prompt = input("Enter your question from pdf")
-                page_number = float(input("Enter page number from pdf"))
                 
                 try:
-                    explanation = find_section_and_respond(client, simple_prompt, page_number, 1)
-                    print(explanation)
+                    page_number = float(input("Enter page number from pdf"))
                 except:
-                    print("Sleep for 1 minute")
-                    time.sleep(60)
+                    page_number = None
+                
+                try:
+                    if page_number > 0 and page_number <= number_of_pages:
+                        try:
+                            explanation = find_section_and_respond(client, simple_prompt, page_number, 1)
+                            print(explanation)
+                        except:
+                            print("Sleep for 1 minute")
+                            time.sleep(60)
+                except:
+                    
+                    system_response = get_system_response(client, simple_prompt)
+                    message_history.append({ 'role': 'assistant', 'content':  system_response})
+                    print(system_response)
+                    
+                
             elif enter_mode == 0:
                 simple_prompt = input("Your user text")
                 system_response = get_system_response(client, simple_prompt)
-                message_history.append({ 'role': 'assistant', 'content':  simple_prompt})
+                message_history.append({ 'role': 'assistant', 'content':  system_response})
                 print(system_response)
             elif enter_mode == 1:
                 record_audio("recording.wav")
@@ -176,11 +190,12 @@ if __name__ == "__main__":
                 simple_prompt = result["text"]
                 print(f"You said {simple_prompt} {len(simple_prompt)}")
                 system_response = get_system_response(client, simple_prompt)
-                message_history.append({ 'role': 'assistant', 'content':  simple_prompt})
+                message_history.append({ 'role': 'assistant', 'content':  system_response})
                 print(system_response)
                 
             elif enter_mode == 3:
                 print("Enter your question from pdf")
+                input("Press when you want to start recording")
                 record_audio("recording.wav")
                 audio = whisper.load_audio("recording.wav")
                 supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
@@ -193,6 +208,7 @@ if __name__ == "__main__":
                 while True:
                     page_number = None
                     print("Say: the information is on page ... ")
+                    input("Press when you want to start recording")
                     record_audio("recording.wav")
                     audio = whisper.load_audio("recording.wav")
                     result = whisper.transcribe(whisper_model, audio, language=native_language)
@@ -210,9 +226,7 @@ if __name__ == "__main__":
                     else:
                         break
                     
-                
-                
-                
+
                 print(f"{simple_prompt} - {page_number}")
                 junk_text = input("text/page ok ?")
                 if "y" not in junk_text:
@@ -221,7 +235,7 @@ if __name__ == "__main__":
                 
                 if page_number  is None:
                     system_response = get_system_response(client, simple_prompt)
-                    message_history.append({ 'role': 'assistant', 'content':  simple_prompt})
+                    message_history.append({ 'role': 'assistant', 'content':  system_response})
                     print(system_response)
                     continue
                 
@@ -232,7 +246,28 @@ if __name__ == "__main__":
                     print("Sleep for 1 minute")
                     time.sleep(60)
                     
+            elif enter_mode == 4:
+                
+                filename = "lecture.wav"
+                # record_audio(filename)
+                audio = whisper.load_audio(filename)
+                
+                supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
+                whisper_model_type = supported_models[0]
+                if whisper_model is None:
+                    whisper_model = whisper.load_model(whisper_model_type) 
+                    
+                result = whisper.transcribe(whisper_model, audio, language=native_language)
+                lecture_text  = result["text"]
+                
+                lp = get_long_prompt(lecture_text)
+                system_response = get_system_response(client, lp)
+                message_history.append({ 'role': 'assistant', 'content':  system_response})
+                print(system_response)
+               
+                             
             elif enter_mode > 4:
+                
                 break
             
     
