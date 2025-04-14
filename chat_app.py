@@ -19,8 +19,10 @@ book_name= "2008-rfs.pdf"
 reader = PdfReader(book_name)
 number_of_pages = len(reader.pages)
 
-    
-pdf_text = ''.join(page.extract_text() for page in reader.pages)
+# Replace the current pdf_text extraction with page-based extraction
+pages_text = [page.extract_text() for page in reader.pages]
+pdf_text = ''.join(pages_text)
+
 number_of_chunks = 10
 chunk_size = len(pdf_text)//number_of_chunks
 message_history = []
@@ -65,55 +67,66 @@ def getLanguage(phrase):
 
 
 
-def chunk_getter(index, book_name):    
-    return pdf_text[index  * chunk_size : index  * chunk_size + chunk_size]
+def chunk_getter(page_number, chunk_width):
+    """Get text chunks centered around a specific page"""
+    # Convert to 0-based index
+    page_idx = int(page_number) - 1
     
+    # Calculate the range of pages to include
+    start_page = max(0, page_idx - chunk_width//2)
+    end_page = min(number_of_pages - 1, page_idx + chunk_width//2)
     
-    
+    # Get text from the range of pages
+    return ' '.join(pages_text[start_page:end_page + 1])
+
 def get_completion_pdf(client, simple_prompt, page_number: int, chunk_width):
     global book_name, message_history
-    print((page_number, chunk_width))
+    print(f"Analyzing pages around page {page_number} with width {chunk_width}")
     
-    #0 based
-    chunk_index = floor((page_number * number_of_chunks/number_of_pages))
-    
-    text_chunk = ""
-    
-    if chunk_width == 1:
-        text_chunk = chunk_getter(chunk_index, book_name)
-    else:
-        n_chunks_back = (chunk_width - 1)//2
-        for ci in range(chunk_index - n_chunks_back, chunk_index + n_chunks_back + 1):
-            text_chunk = text_chunk + chunk_getter(ci, book_name)
+    text_chunk = chunk_getter(page_number, chunk_width)
             
-    prompt = f"here is an extract from an academic book <book> {text_chunk} </book>. \
-                Use this context to answer to the following question {simple_prompt}. Respond with None only, if the excerpt does not contain detailed information about the question. Otherwise indicate section and chapter of the book."
+    prompt = ("Here is an extract from an academic book:\n\n"
+             f"<book>{text_chunk}</book>\n\n"
+             f"Use this context to answer the following question: {simple_prompt}\n"
+             "Respond with None only if the excerpt does not contain detailed information about the question. "
+             "Otherwise also indicate section and chapter of the book.")
     
-    message_history.append({"role": 'user', "content":  prompt})
+    message_history.append({"role": 'user', "content": prompt})
     
     return client.messages.create(
         model=MODEL_NAME,
         max_tokens=2048,
-        temperature = 0.75,
+        temperature=0.75,
         system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts.",
-        messages = message_history
+        messages=message_history
     ).content[0].text
     
 
 def find_section_and_respond(client, simple_prompt, page_number: int, chunk_width):
     global message_history
-    while True:
-        time.sleep(60)
+    max_width = min(32, number_of_pages)  # Cap the maximum width
+    attempts = 0
+    max_attempts = 5  # Prevent infinite loops
+    
+    while chunk_width <= max_width and attempts < max_attempts:
+        time.sleep(5)
         delta = random.uniform(-1, 1) * 0.1 * page_number
         
+        print(f"Trying with chunk width: {chunk_width}")
         x_response = get_completion_pdf(client, simple_prompt, page_number + delta, chunk_width)
-        if "None" not in x_response and len(x_response) > 300:
-            print(len(x_response))
-            message_history.append({ "role": 'assistant', "content":  x_response})
-            return x_response
-        else:
-            chunk_width+=2
         
+        if "None" not in x_response and len(x_response) > 300:
+            print(f"Found relevant content with width: {chunk_width}")
+            message_history.append({"role": 'assistant', "content": x_response})
+            return x_response
+        
+        # Geometric growth (multiply by 2 each time)
+        chunk_width = chunk_width * 2
+        attempts += 1
+    
+    # If we get here, we couldn't find a good response
+    return "Could not find relevant information in the specified section of the document."
+
 def  get_system_response(client, simple_prompt):
     global message_history
     message_history.append({ "role": 'user', "content":  simple_prompt})
@@ -153,23 +166,22 @@ if __name__ == "__main__":
                 
                 try:
                     page_number = float(input("Enter page number from pdf"))
-                except:
-                    page_number = None
-                
-                try:
+                    
                     if page_number > 0 and page_number <= number_of_pages:
                         try:
-                            explanation = find_section_and_respond(client, simple_prompt, page_number, 1)
+                            explanation = find_section_and_respond(client, simple_prompt, page_number, 2)
                             print(explanation)
-                        except:
+                        except Exception as e:  # Specify the exception type
+                            print(f"Error in find_section_and_respond: {e}")
                             print("Sleep for 1 minute")
-                            time.sleep(60)
-                except:
-                    
+                            time.sleep(30)
+                    else:
+                        print(f"Page number must be between 1 and {number_of_pages}")
+                except ValueError:
+                    print("Invalid page number")
                     system_response = get_system_response(client, simple_prompt)
                     message_history.append({ 'role': 'assistant', 'content':  system_response})
                     print(system_response)
-                    
                 
             elif enter_mode == 0:
                 simple_prompt = input("Your user text")
@@ -177,6 +189,7 @@ if __name__ == "__main__":
                 message_history.append({ 'role': 'assistant', 'content':  system_response})
                 print(system_response)
             elif enter_mode == 1:
+                input("Press Enter when you want to start recording...")
                 record_audio("recording.wav")
                 audio = whisper.load_audio("recording.wav")
                 
@@ -188,7 +201,7 @@ if __name__ == "__main__":
                 
                 result = whisper.transcribe(whisper_model, audio, language=native_language)
                 simple_prompt = result["text"]
-                print(f"You said {simple_prompt} {len(simple_prompt)}")
+                print(f"You said: {simple_prompt} {len(simple_prompt)}")
                 system_response = get_system_response(client, simple_prompt)
                 message_history.append({ 'role': 'assistant', 'content':  system_response})
                 print(system_response)
@@ -217,10 +230,10 @@ if __name__ == "__main__":
                         page_number = float(extract_number(result["text"]))
                     except:
                         print(page_number)
-                        break
+                        continue
                     
                     
-                    if page_number > 1.1 * number_of_pages:
+                    if page_number > number_of_pages:
                         print(page_number)
                         continue
                     else:
@@ -232,15 +245,8 @@ if __name__ == "__main__":
                 if "y" not in junk_text:
                     continue
                 
-                
-                if page_number  is None:
-                    system_response = get_system_response(client, simple_prompt)
-                    message_history.append({ 'role': 'assistant', 'content':  system_response})
-                    print(system_response)
-                    continue
-                
                 try:
-                    explanation = find_section_and_respond(client, simple_prompt, page_number, 1)
+                    explanation = find_section_and_respond(client, simple_prompt, page_number, 2)
                     print(explanation)
                 except:
                     print("Sleep for 1 minute")
@@ -264,11 +270,11 @@ if __name__ == "__main__":
                 system_response = get_system_response(client, lp)
                 message_history.append({ 'role': 'assistant', 'content':  system_response})
                 print(system_response)
+                
+            break
                
                              
-            elif enter_mode > 4:
-                
-                break
+            
             
     
         
