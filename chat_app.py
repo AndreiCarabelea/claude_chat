@@ -9,11 +9,15 @@ import whisper_timestamped as whisper
 from langdetect import detect
 import re 
 from prompt import get_long_prompt
+import os
+import json
+import hashlib
+import re
 
 #second change
 
 client = Anthropic()
-MODEL_NAME = ["claude-3-5-sonnet-20240620", "claude-3-haiku-20240307"][0]
+MODEL_NAME = ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-7-sonnet-20250219"][0]
 
 book_name= "2008-rfs.pdf"
 reader = PdfReader(book_name)
@@ -141,6 +145,115 @@ def  get_system_response(client, simple_prompt):
     ).content[0].text
     
 
+def save_to_html(system_response):
+    """
+    Save the system response to a simple, valid HTML file.
+    """
+    # Process the content - convert markdown-style formatting to HTML
+    # Replace newlines with <br> tags
+    processed_content = system_response.replace('\n', '<br>\n')
+    
+    # Replace markdown-style bold (**text**) with HTML bold
+    processed_content = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', processed_content)
+    
+    # Replace markdown-style headers (# Header) with HTML headers
+    processed_content = re.sub(r'^# (.*?)$', r'<h1>\1</h1>', processed_content, flags=re.MULTILINE)
+    processed_content = re.sub(r'^## (.*?)$', r'<h2>\1</h2>', processed_content, flags=re.MULTILINE)
+    processed_content = re.sub(r'^### (.*?)$', r'<h3>\1</h3>', processed_content, flags=re.MULTILINE)
+    
+    # Create a simple HTML document
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lecture Analysis</title>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        .container {{
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        h1, h2, h3 {{
+            color: #2c5282;
+        }}
+        .timestamp {{
+            color: #666;
+            text-align: right;
+            font-size: 0.8em;
+            margin-bottom: 20px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Lecture Analysis</h1>
+        <div class="timestamp">Generated on: {time.strftime('%Y-%m-%d %H:%M:%S')}</div>
+        <div class="content">
+            {processed_content}
+        </div>
+    </div>
+</body>
+</html>"""
+    
+    # Write the HTML to a file
+    with open('audio_demo.html', 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    
+    print("Analysis saved to audio_demo.html")
+
+def get_audio_hash(audio_file_path):
+    """Generate a hash of the audio file for caching purposes"""
+    with open(audio_file_path, 'rb') as f:
+        file_hash = hashlib.md5(f.read()).hexdigest()
+    return file_hash
+
+def transcribe_audio(audio_file_path, model_type, language):
+    """Transcribe audio with caching"""
+    # Skip caching for recording.wav since it changes frequently
+    if os.path.basename(audio_file_path) == "recording.wav":
+        audio = whisper.load_audio(audio_file_path)
+        whisper_model = whisper.load_model(model_type, device="cpu")
+        return whisper.transcribe(whisper_model, audio, language=language)
+    print(audio_file_path)
+    # For all other files, use caching
+    file_hash = get_audio_hash(audio_file_path)
+    cache_dir = os.path.join(os.getcwd(), 'transcription_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    cache_file = os.path.join(cache_dir, f"{file_hash}_{language}.json")
+    
+    # Check if we have a cached version
+    if os.path.exists(cache_file):
+        print(f"Loading cached transcription for {os.path.basename(audio_file_path)}")
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    
+    # If not cached, perform the transcription
+    print(f"Transcribing {os.path.basename(audio_file_path)}...")
+    audio = whisper.load_audio(audio_file_path)
+    
+    # Ensure model is loaded
+    whisper_model = whisper.load_model(model_type, device="cpu")
+    
+    # Perform transcription
+    result = whisper.transcribe(whisper_model, audio, language=language)
+    
+    # Cache the result
+    with open(cache_file, 'w', encoding='utf-8') as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    
+    return result
+
 if __name__ == "__main__":      
     
     while True:
@@ -174,7 +287,7 @@ if __name__ == "__main__":
                         except Exception as e:  # Specify the exception type
                             print(f"Error in find_section_and_respond: {e}")
                             print("Sleep for 1 minute")
-                            time.sleep(30)
+                            time.sleep(10)
                     else:
                         print(f"Page number must be between 1 and {number_of_pages}")
                 except ValueError:
@@ -191,15 +304,12 @@ if __name__ == "__main__":
             elif enter_mode == 1:
                 input("Press Enter when you want to start recording...")
                 record_audio("recording.wav")
-                audio = whisper.load_audio("recording.wav")
                 
                 supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
                 whisper_model_type = supported_models[0]
                 
-                if whisper_model is None:
-                    whisper_model = whisper.load_model(whisper_model_type, device="cpu") 
-                
-                result = whisper.transcribe(whisper_model, audio, language=native_language)
+                # Use cached transcription function
+                result = transcribe_audio("recording.wav", whisper_model_type, native_language)
                 simple_prompt = result["text"]
                 print(f"You said: {simple_prompt} {len(simple_prompt)}")
                 system_response = get_system_response(client, simple_prompt)
@@ -253,23 +363,21 @@ if __name__ == "__main__":
                     time.sleep(60)
                     
             elif enter_mode == 4:
-                
                 filename = "lecture.wav"
-                # record_audio(filename)
-                audio = whisper.load_audio(filename)
                 
                 supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
                 whisper_model_type = supported_models[0]
-                if whisper_model is None:
-                    whisper_model = whisper.load_model(whisper_model_type) 
-                    
-                result = whisper.transcribe(whisper_model, audio, language=native_language)
-                lecture_text  = result["text"]
+                
+                # Use cached transcription function 
+                result = transcribe_audio(filename, whisper_model_type, native_language)
+                lecture_text = result["text"]
                 
                 lp = get_long_prompt(lecture_text)
                 system_response = get_system_response(client, lp)
                 message_history.append({ 'role': 'assistant', 'content':  system_response})
                 print(system_response)
+                
+                save_to_html(system_response)
                 
             break
                
