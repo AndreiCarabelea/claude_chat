@@ -199,3 +199,5 @@ def save_to_html(system_response):
         f.write('\n'.join(html_parts))
     
     print("Analysis saved to audio_demo.html")
+
+    return 'audio_demo.html'
