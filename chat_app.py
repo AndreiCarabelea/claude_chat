@@ -12,27 +12,28 @@ from langdetect import detect
 import re 
 from prompt import get_long_prompt
 import os
+import sys
 import json
 import hashlib
-import re
 import tempfile
 import keyboard
 
 #second change
 
 client = Anthropic()
-MODEL_NAME = ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-7-sonnet-20250219"][1]
 
-book_name= "2008-rfs.pdf"
-reader = PdfReader(book_name)
-number_of_pages = len(reader.pages)
+# Define model options
+MODEL_OPTIONS = {
+    "Claude 3.5 Sonnet": "claude-3-5-sonnet-20241022",
+    "Claude 3.5 Haiku": "claude-3-5-haiku-20241022",
+    "Claude 3.7 Sonnet": "claude-3-7-sonnet-20250219", 
+    "Claude Sonnet 4": "claude-sonnet-4-20250514", 
+    "Claude Opus 4": "claude-opus-4-20250514"
+}
 
-# Replace the current pdf_text extraction with page-based extraction
-pages_text = [page.extract_text() for page in reader.pages]
-pdf_text = ''.join(pages_text)
-
-number_of_chunks = 10
-chunk_size = len(pdf_text)//number_of_chunks
+# Initialize MODEL_NAME in session state if not already present
+if 'model_name' not in st.session_state:
+    st.session_state.model_name = MODEL_OPTIONS["Claude 3.5 Haiku"]  # Default model
 
 # Initialize session state variables
 if 'message_history' not in st.session_state:
@@ -48,11 +49,6 @@ if 'recording_status' not in st.session_state:
 
 # Setup Anthropic client
 client = Anthropic()
-MODEL_OPTIONS = {
-    "Claude 3 Sonnet": "claude-3-5-sonnet-20241022",
-    "Claude 3 Haiku": "claude-3-5-haiku-20241022",
-    "Claude 3.7 Sonnet": "claude-3-7-sonnet-20250219"
-}
 
 def extract_number(text):
     """
@@ -95,15 +91,19 @@ def getLanguage(phrase):
 
 def chunk_getter(page_number, chunk_width):
     """Get text chunks centered around a specific page"""
+    # Use session state data instead of global variables
+    if not st.session_state.pages_text:
+        return "No PDF loaded"
+        
     # Convert to 0-based index
     page_idx = int(page_number) - 1
     
     # Calculate the range of pages to include
     start_page = max(0, page_idx - chunk_width//2)
-    end_page = min(number_of_pages - 1, page_idx + chunk_width//2)
+    end_page = min(st.session_state.number_of_pages - 1, page_idx + chunk_width//2)
     
     # Get text from the range of pages
-    return ' '.join(pages_text[start_page:end_page + 1])
+    return ' '.join(st.session_state.pages_text[start_page:end_page + 1])
 
 def get_completion_pdf(client, simple_prompt, page_number, chunk_width):
     """Get completion from Claude for PDF content"""
@@ -120,7 +120,7 @@ def get_completion_pdf(client, simple_prompt, page_number, chunk_width):
     st.session_state.message_history.append({"role": 'user', "content": prompt})
     
     response = client.messages.create(
-        model=MODEL_NAME,
+        model=st.session_state.model_name,
         max_tokens=2048,
         temperature=0.75,
         system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts.",
@@ -164,18 +164,29 @@ def find_section_and_respond(client, simple_prompt, page_number, chunk_width):
 def get_system_response(client, simple_prompt):
     """Get standard response from Claude"""
     st.session_state.message_history.append({"role": 'user', "content": simple_prompt})
+    st.write("get_system_response 1")
     
-    response = client.messages.create(
-        model=MODEL_NAME,
-        max_tokens=2048,
-        temperature=0.75,
-        system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts.",
-        messages=st.session_state.message_history
-    )
-    
-    result = response.content[0].text
-    st.session_state.message_history.append({"role": 'assistant', "content": result})
-    return result
+    try:
+        response = client.messages.create(
+            model=st.session_state.model_name,
+            max_tokens=2048,
+            temperature=0.75,
+            system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts.",
+            messages=st.session_state.message_history
+        )
+        st.write("get_system_response 2")
+        
+        result = response.content[0].text
+        st.write("get_system_response 3")
+        
+        st.session_state.message_history.append({"role": 'assistant', "content": result})
+        return result
+    except Exception as e:
+        st.error(f"Error in get_system_response: {str(e)}")
+        st.write(f"Error type: {type(e).__name__}")
+        import traceback
+        st.write(f"Traceback: {traceback.format_exc()}")
+        return "An error occurred while processing your request."
 
 def get_audio_hash(audio_file_path):
     """Generate a hash of the audio file for caching purposes"""
@@ -183,25 +194,26 @@ def get_audio_hash(audio_file_path):
         file_hash = hashlib.md5(f.read()).hexdigest()
     return file_hash
 
-def transcribe_audio(audio_file_path, model_type="base", language=None):
+def transcribe_audio(audio_file_path, model_type="base", language=None, use_cache=False):
     """
-    Transcribe audio with caching to avoid repeated transcriptions
+    Transcribe audio with optional caching to avoid repeated transcriptions
     """
-    file_hash = get_audio_hash(audio_file_path)
+    if use_cache:
+        file_hash = get_audio_hash(audio_file_path)
+        
+        # Create a cache directory if it doesn't exist
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcription_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        cache_file = os.path.join(cache_dir, f"{file_hash}_{language}.json")
+        
+        # Check if we have a cached version
+        if os.path.exists(cache_file):
+            st.info(f"Loading cached transcription for {os.path.basename(audio_file_path)}")
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
     
-    # Create a cache directory if it doesn't exist
-    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcription_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    cache_file = os.path.join(cache_dir, f"{file_hash}_{language}.json")
-    
-    # Check if we have a cached version
-    if os.path.exists(cache_file):
-        st.info(f"Loading cached transcription for {os.path.basename(audio_file_path)}")
-        with open(cache_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    
-    # If not cached, perform the transcription
+    # If not cached or caching disabled, perform the transcription
     with st.spinner(f"Transcribing {os.path.basename(audio_file_path)}..."):
         audio = whisper.load_audio(audio_file_path)
         
@@ -211,9 +223,10 @@ def transcribe_audio(audio_file_path, model_type="base", language=None):
         # Perform transcription
         result = whisper.transcribe(whisper_model, audio, language=language)
         
-        # Cache the result
-        with open(cache_file, 'w', encoding='utf-8') as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
+        # Cache the result if caching is enabled
+        if use_cache:
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
         
         return result
 
@@ -244,7 +257,7 @@ st.title("PDF and Audio Analysis App")
 with st.sidebar:
     st.header("Configuration")
     selected_model = st.selectbox("Select AI Model", list(MODEL_OPTIONS.keys()), index=1)
-    MODEL_NAME = MODEL_OPTIONS[selected_model]
+    st.session_state.model_name = MODEL_OPTIONS[selected_model]
     
     # PDF Upload
     st.subheader("PDF Upload")
@@ -295,52 +308,25 @@ if mode == "Text Chat (Mode 0)":
 elif mode == "Audio Chat (Mode 1)":
     st.header("Audio Chat")
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.write("Record your message:")
-        if st.button("Start Recording"):
-            with st.spinner("Recording... Press the 'q' key to stop."):
-                record_audio("recording.wav")
-                st.success("Recording finished!")
-                
-                # Process the recording
-                with st.spinner("Transcribing..."):
-                    supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
-                    whisper_model_type = supported_models[1]
-                    
-                    result = transcribe_audio("recording.wav", whisper_model_type, "en")
-                    simple_prompt = result["text"]
-                    
-                    st.write(f"**You said:** {simple_prompt}")
-                    
-                    # Get response from Claude
-                    response = get_system_response(client, simple_prompt)
-                    st.write(f"**Claude:** {response}")
-    
-    with col2:
-        st.write("Or upload an audio file:")
-        uploaded_audio = st.file_uploader("Upload audio file", type=["wav", "mp3"])
-        
-        if uploaded_audio:
-            # Save to a temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
-                tmp_file.write(uploaded_audio.getvalue())
-                audio_path = tmp_file.name
+    st.write("Record your message:")
+    if st.button("Start Recording"):
+        with st.spinner("Recording... Press the 'q' key to stop."):
+            record_audio("recording.wav")
+            st.success("Recording finished!")
             
-            if st.button("Process Audio"):
-                with st.spinner("Transcribing..."):
-                    supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
-                    whisper_model_type = supported_models[1]
-                    
-                    result = transcribe_audio(audio_path, whisper_model_type, "en")
-                    simple_prompt = result["text"]
-                    
-                    st.write(f"**Audio content:** {simple_prompt}")
-                    
-                    # Get response from Claude
-                    response = get_system_response(client, simple_prompt)
-                    st.write(f"**Claude:** {response}")
+            # Process the recording
+            with st.spinner("Transcribing..."):
+                supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
+                whisper_model_type = supported_models[1]
+                
+                result = transcribe_audio("recording.wav", whisper_model_type, "en", use_cache=False)
+                simple_prompt = result["text"]
+                
+                st.write(f"**You said:** {simple_prompt}")
+                
+                # Get response from Claude
+                response = get_system_response(client, simple_prompt)
+                st.write(f"**Claude:** {response}")
 
 # Mode 2: Text-PDF Analysis
 elif mode == "Text-PDF Analysis (Mode 2)":
@@ -350,6 +336,7 @@ elif mode == "Text-PDF Analysis (Mode 2)":
         st.warning("Please upload a PDF document in the sidebar first.")
     else:
         st.write(f"Currently analyzing: {st.session_state.book_name}")
+        st.write(f"Document has {st.session_state.number_of_pages} pages")
         
         simple_prompt = st.text_area("Enter your question about the PDF:")
         page_number = st.number_input("Enter page number:", min_value=1, max_value=st.session_state.number_of_pages, value=1)
@@ -383,16 +370,16 @@ elif mode == "Audio-PDF Analysis (Mode 3)":
                     supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
                     whisper_model_type = supported_models[0]
                     
-                    result = transcribe_audio("recording.wav", whisper_model_type, "en")
+                    result = transcribe_audio("recording.wav", whisper_model_type, "en", use_cache=False)
                     st.session_state.question_text = result["text"]
                     
                     st.write(f"**Your question:** {st.session_state.question_text}")
-                    st.experimental_rerun()
+                    st.rerun()
         else:
             st.write(f"**Your question:** {st.session_state.question_text}")
             if st.button("Record Again"):
                 del st.session_state.question_text
-                st.experimental_rerun()
+                st.rerun()
         
         # Step 2: Get page number
         if 'question_text' in st.session_state:
@@ -410,7 +397,7 @@ elif mode == "Audio-PDF Analysis (Mode 3)":
                         supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
                         whisper_model_type = supported_models[0]
                         
-                        result = transcribe_audio("recording.wav", whisper_model_type, "en")
+                        result = transcribe_audio("recording.wav", whisper_model_type, "en", use_cache=False)
                         page_text = result["text"]
                         
                         try:
@@ -418,7 +405,7 @@ elif mode == "Audio-PDF Analysis (Mode 3)":
                             if extracted_page and 1 <= extracted_page <= st.session_state.number_of_pages:
                                 st.session_state.page_number = extracted_page
                                 st.write(f"**Page number recognized:** {extracted_page}")
-                                st.experimental_rerun()
+                                st.rerun()
                             else:
                                 st.error(f"Could not extract a valid page number from '{page_text}'")
                         except:
@@ -428,12 +415,12 @@ elif mode == "Audio-PDF Analysis (Mode 3)":
                 manual_page = st.number_input("Or enter page manually:", min_value=1, max_value=st.session_state.number_of_pages)
                 if st.button("Use This Page"):
                     st.session_state.page_number = manual_page
-                    st.experimental_rerun()
+                    st.rerun()
             else:
                 st.write(f"**Selected page:** {st.session_state.page_number}")
                 if st.button("Change Page"):
                     del st.session_state.page_number
-                    st.experimental_rerun()
+                    st.rerun()
         
         # Step 3: Show results
         if 'question_text' in st.session_state and 'page_number' in st.session_state:
@@ -454,7 +441,7 @@ elif mode == "Audio-PDF Analysis (Mode 3)":
                     del st.session_state.question_text
                 if 'page_number' in st.session_state:
                     del st.session_state.page_number
-                st.experimental_rerun()
+                st.rerun()
 
 # Mode 4: Audio Analysis
 elif mode == "Audio Analysis (Mode 4)":
@@ -475,7 +462,7 @@ elif mode == "Audio Analysis (Mode 4)":
                 supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
                 whisper_model_type = supported_models[0]
                 
-                result = transcribe_audio(lecture_path, whisper_model_type, "en")
+                result = transcribe_audio(lecture_path, whisper_model_type, "en", use_cache=True)
                 lecture_text = result["text"]
             
             st.success("Transcription complete!")
