@@ -21,7 +21,6 @@ import keyboard
 #second change
 
 #https://docs.anthropic.com/en/docs/about-claude/models/overview
-client = Anthropic()
 
 # Define model options
 MODEL_OPTIONS = {
@@ -37,6 +36,8 @@ if 'model_name' not in st.session_state:
     st.session_state.model_name = MODEL_OPTIONS["Claude 3.5 Haiku"]  # Default model
 
 # Initialize session state variables
+if 'anthropic_api_key' not in st.session_state:
+    st.session_state.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 if 'message_history' not in st.session_state:
     st.session_state.message_history = []
 if 'pages_text' not in st.session_state:
@@ -49,9 +50,12 @@ if 'recording_status' not in st.session_state:
     st.session_state.recording_status = "stopped"
 if 'recorder' not in st.session_state:
     st.session_state.recorder = None
+if 'audio_chat_transcription' not in st.session_state:
+    st.session_state.audio_chat_transcription = None
+if 'audio_chat_response' not in st.session_state:
+    st.session_state.audio_chat_response = None
 
-# Setup Anthropic client
-client = Anthropic()
+# Setup Anthropic client will be handled after we confirm the API key is set.
 
 def extract_number(text):
     """
@@ -239,6 +243,23 @@ st.title("PDF and Audio Analysis App")
 # Sidebar for configuration
 with st.sidebar:
     st.header("Configuration")
+    
+    # API Key Management
+    if not st.session_state.get("anthropic_api_key"):
+        st.warning("Anthropic API key not found!")
+        api_key_input = st.text_input(
+            "Enter your Anthropic API Key", 
+            type="password", 
+            key="api_key_input",
+            help="You can find your API key on your Anthropic dashboard."
+        )
+        if api_key_input:
+            st.session_state.anthropic_api_key = api_key_input
+            st.success("API Key set for this session.")
+            st.rerun()
+    else:
+        st.success("Anthropic API key is set.")
+
     selected_model = st.selectbox("Select AI Model", list(MODEL_OPTIONS.keys()), index=1)
     st.session_state.model_name = MODEL_OPTIONS[selected_model]
     
@@ -264,253 +285,274 @@ with st.sidebar:
         st.session_state.message_history = []
         st.success("Conversation history cleared!")
 
-# Mode selection
-mode = st.selectbox(
-    "Select Mode", 
-    ["Text Chat (Mode 0)", 
-     "Audio Chat (Mode 1)", 
-     "Text-PDF Analysis (Mode 2)", 
-     "Audio-PDF Analysis (Mode 3)", 
-     "Audio Analysis (Mode 4)"]
-)
+# Main app logic
+if not st.session_state.get("anthropic_api_key"):
+    st.error("Please enter your Anthropic API key in the sidebar to continue.")
+else:
+    try:
+        client = Anthropic(api_key=st.session_state.anthropic_api_key)
+    except Exception as e:
+        st.error(f"Failed to initialize Anthropic client. Please check your API key. Error: {e}")
+        client = None
 
-# Mode 0: Text Chat
-if mode == "Text Chat (Mode 0)":
-    st.header("Text Chat")
-    
-    user_input = st.text_area("Your message:")
-    
-    if st.button("Send"):
-        if user_input:
-            st.write(f"**You:** {user_input}")
-            with st.spinner("Claude is thinking..."):
-                response = get_system_response(client, user_input)
-            st.write(f"**Claude:** {response}")
+    if client:
+        # Mode selection
+        mode = st.selectbox(
+            "Select Mode", 
+            ["Text Chat (Mode 0)", 
+             "Audio Chat (Mode 1)", 
+             "Text-PDF Analysis (Mode 2)", 
+             "Audio-PDF Analysis (Mode 3)", 
+             "Audio Analysis (Mode 4)"]
+        )
 
-# Mode 1: Audio Chat
-elif mode == "Audio Chat (Mode 1)":
-    st.header("Audio Chat")
-    
-    st.write("Record your message:")
-    
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if st.button("Start Recording"):
-            if st.session_state.recorder is None:
-                st.session_state.recorder = AudioRecorder()
-            st.session_state.recorder.start()
-            st.session_state.recording_status = "recording"
-            st.info("Recording... Click 'Stop Recording' to finish.")
-
-    with col2:
-        if st.button("Stop Recording"):
-            if st.session_state.recorder and st.session_state.recording_status == "recording":
-                st.session_state.recorder.stop("recording.wav")
-                st.session_state.recording_status = "stopped"
-                st.session_state.recorder = None  # Reset recorder
-                st.success("Recording finished!")
-
-                # Process the recording
-                with st.spinner("Transcribing..."):
-                    supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
-                    whisper_model_type = supported_models[1]
-                    
-                    result = transcribe_audio("recording.wav", whisper_model_type, "en", use_cache=False)
-                    simple_prompt = result["text"]
-                    
-                    st.write(f"**You said:** {simple_prompt}")
-                    
-                    # Get response from Claude
-                    response = get_system_response(client, simple_prompt)
+        # Mode 0: Text Chat
+        if mode == "Text Chat (Mode 0)":
+            st.header("Text Chat")
+            
+            user_input = st.text_area("Your message:")
+            
+            if st.button("Send"):
+                if user_input:
+                    st.write(f"**You:** {user_input}")
+                    with st.spinner("Claude is thinking..."):
+                        response = get_system_response(client, user_input)
                     st.write(f"**Claude:** {response}")
-            else:
-                st.warning("Not currently recording.")
 
-# Mode 2: Text-PDF Analysis
-elif mode == "Text-PDF Analysis (Mode 2)":
-    st.header("Text-PDF Analysis")
-    
-    if not st.session_state.pages_text:
-        st.warning("Please upload a PDF document in the sidebar first.")
-    else:
-        st.write(f"Currently analyzing: {st.session_state.book_name}")
-        st.write(f"Document has {st.session_state.number_of_pages} pages")
-        
-        simple_prompt = st.text_area("Enter your question about the PDF:")
-        page_number = st.number_input("Enter page number:", min_value=1, max_value=st.session_state.number_of_pages, value=1)
-        
-        if st.button("Ask Question"):
-            if simple_prompt:
-                with st.spinner("Analyzing document..."):
-                    explanation = find_section_and_respond(client, simple_prompt, page_number, 2)
-                st.write("**Answer:**")
-                st.write(explanation)
-
-# Mode 3: Audio-PDF Analysis
-elif mode == "Audio-PDF Analysis (Mode 3)":
-    st.header("Audio-PDF Analysis")
-    
-    if not st.session_state.pages_text:
-        st.warning("Please upload a PDF document in the sidebar first.")
-    else:
-        st.write(f"Currently analyzing: {st.session_state.book_name}")
-        
-        # Step 1: Record question
-        st.subheader("Step 1: Record your question")
-        
-        if 'question_text' not in st.session_state:
+        # Mode 1: Audio Chat
+        elif mode == "Audio Chat (Mode 1)":
+            st.header("Audio Chat")
+            
+            st.write("Record your message:")
+            
             col1, col2 = st.columns(2)
+
             with col1:
-                if st.button("Start Recording Question"):
+                if st.button("Start Recording"):
+                    # Clear previous results
+                    st.session_state.audio_chat_transcription = None
+                    st.session_state.audio_chat_response = None
                     if st.session_state.recorder is None:
                         st.session_state.recorder = AudioRecorder()
                     st.session_state.recorder.start()
-                    st.session_state.recording_status = "recording_question"
-                    st.info("Recording question...")
+                    st.session_state.recording_status = "recording"
+                    st.info("Recording... Click 'Stop Recording' to finish.")
 
             with col2:
-                if st.button("Stop Recording Question"):
-                    if st.session_state.recorder and st.session_state.recording_status == "recording_question":
+                if st.button("Stop Recording"):
+                    if st.session_state.recorder and st.session_state.recording_status == "recording":
                         st.session_state.recorder.stop("recording.wav")
                         st.session_state.recording_status = "stopped"
-                        st.session_state.recorder = None
+                        st.session_state.recorder = None  # Reset recorder
                         st.success("Recording finished!")
-                        
+
                         # Process the recording
+                        with st.spinner("Transcribing..."):
+                            supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
+                            whisper_model_type = supported_models[1]
+                            
+                            result = transcribe_audio("recording.wav", whisper_model_type, "en", use_cache=False)
+                            st.session_state.audio_chat_transcription = result["text"]
+                            
+                        # Get response from Claude
+                        with st.spinner("Claude is thinking..."):
+                            response = get_system_response(client, st.session_state.audio_chat_transcription)
+                            st.session_state.audio_chat_response = response
+
+                        st.rerun()
+                    else:
+                        st.warning("Not currently recording.")
+
+            # Display the results full-width
+            if st.session_state.audio_chat_transcription:
+                st.write(f"**You said:** {st.session_state.audio_chat_transcription}")
+            if st.session_state.audio_chat_response:
+                st.write(f"**Claude:** {st.session_state.audio_chat_response}")
+
+        # Mode 2: Text-PDF Analysis
+        elif mode == "Text-PDF Analysis (Mode 2)":
+            st.header("Text-PDF Analysis")
+            
+            if not st.session_state.pages_text:
+                st.warning("Please upload a PDF document in the sidebar first.")
+            else:
+                st.write(f"Currently analyzing: {st.session_state.book_name}")
+                st.write(f"Document has {st.session_state.number_of_pages} pages")
+                
+                simple_prompt = st.text_area("Enter your question about the PDF:")
+                page_number = st.number_input("Enter page number:", min_value=1, max_value=st.session_state.number_of_pages, value=1)
+                
+                if st.button("Ask Question"):
+                    if simple_prompt:
+                        with st.spinner("Analyzing document..."):
+                            explanation = find_section_and_respond(client, simple_prompt, page_number, 2)
+                        st.write("**Answer:**")
+                        st.write(explanation)
+
+        # Mode 3: Audio-PDF Analysis
+        elif mode == "Audio-PDF Analysis (Mode 3)":
+            st.header("Audio-PDF Analysis")
+            
+            if not st.session_state.pages_text:
+                st.warning("Please upload a PDF document in the sidebar first.")
+            else:
+                st.write(f"Currently analyzing: {st.session_state.book_name}")
+                
+                # Step 1: Record question
+                st.subheader("Step 1: Record your question")
+                
+                if 'question_text' not in st.session_state:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("Start Recording Question"):
+                            if st.session_state.recorder is None:
+                                st.session_state.recorder = AudioRecorder()
+                            st.session_state.recorder.start()
+                            st.session_state.recording_status = "recording_question"
+                            st.info("Recording question...")
+
+                    with col2:
+                        if st.button("Stop Recording Question"):
+                            if st.session_state.recorder and st.session_state.recording_status == "recording_question":
+                                st.session_state.recorder.stop("recording.wav")
+                                st.session_state.recording_status = "stopped"
+                                st.session_state.recorder = None
+                                st.success("Recording finished!")
+                                
+                                # Process the recording
+                                supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
+                                whisper_model_type = supported_models[0]
+                                
+                                result = transcribe_audio("recording.wav", whisper_model_type, "en", use_cache=False)
+                                st.session_state.question_text = result["text"]
+                                
+                                st.write(f"**Your question:** {st.session_state.question_text}")
+                                st.rerun()
+
+                else:
+                    st.write(f"**Your question:** {st.session_state.question_text}")
+                    if st.button("Record Again"):
+                        del st.session_state.question_text
+                        st.rerun()
+                
+                # Step 2: Get page number
+                if 'question_text' in st.session_state:
+                    st.subheader("Step 2: Specify the page number")
+                    
+                    if 'page_number' not in st.session_state:
+                        st.write("Say: the information is on page ...")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.button("Start Recording Page Number"):
+                                if st.session_state.recorder is None:
+                                    st.session_state.recorder = AudioRecorder()
+                                st.session_state.recorder.start()
+                                st.session_state.recording_status = "recording_page"
+                                st.info("Recording page number...")
+
+                        with col2:
+                            if st.button("Stop Recording Page Number"):
+                                if st.session_state.recorder and st.session_state.recording_status == "recording_page":
+                                    st.session_state.recorder.stop("recording.wav")
+                                    st.session_state.recording_status = "stopped"
+                                    st.session_state.recorder = None
+                                    st.success("Recording finished!")
+                                    
+                                    # Process the recording
+                                    supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
+                                    whisper_model_type = supported_models[0]
+                                    
+                                    result = transcribe_audio("recording.wav", whisper_model_type, "en", use_cache=False)
+                                    page_text = result["text"]
+                                    
+                                    try:
+                                        extracted_page = extract_number(page_text)
+                                        if extracted_page and 1 <= extracted_page <= st.session_state.number_of_pages:
+                                            st.session_state.page_number = extracted_page
+                                            st.write(f"**Page number recognized:** {extracted_page}")
+                                            st.rerun()
+                                        else:
+                                            st.error(f"Could not extract a valid page number from '{page_text}'")
+                                    except:
+                                        st.error("Failed to extract page number")
+                        
+                        # Alternative: manual page input
+                        manual_page = st.number_input("Or enter page manually:", min_value=1, max_value=st.session_state.number_of_pages)
+                        if st.button("Use This Page"):
+                            st.session_state.page_number = manual_page
+                            st.rerun()
+                    else:
+                        st.write(f"**Selected page:** {st.session_state.page_number}")
+                        if st.button("Change Page"):
+                            del st.session_state.page_number
+                            st.rerun()
+                
+                # Step 3: Show results
+                if 'question_text' in st.session_state and 'page_number' in st.session_state:
+                    st.subheader("Step 3: Get Answer")
+                    
+                    st.write(f"**Question:** {st.session_state.question_text}")
+                    st.write(f"**Page:** {st.session_state.page_number}")
+                    
+                    if st.button("Get Answer"):
+                        with st.spinner("Analyzing PDF..."):
+                            explanation = find_section_and_respond(client, st.session_state.question_text, st.session_state.page_number, 2)
+                        
+                        st.write("**Answer:**")
+                        st.write(explanation)
+                    
+                    if st.button("Start Over"):
+                        if 'question_text' in st.session_state:
+                            del st.session_state.question_text
+                        if 'page_number' in st.session_state:
+                            del st.session_state.page_number
+                        st.rerun()
+
+        # Mode 4: Audio Analysis
+        elif mode == "Audio Analysis (Mode 4)":
+            st.header("Audio Lecture Analysis")
+            
+            # Upload lecture audio
+            uploaded_lecture = st.file_uploader("Upload lecture audio", type=["wav", "mp3"])
+            
+            if uploaded_lecture:
+                # Save to a temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
+                    tmp_file.write(uploaded_lecture.getvalue())
+                    lecture_path = tmp_file.name
+                
+                if st.button("Analyze Lecture"):
+                    # Process the lecture
+                    with st.spinner("Transcribing lecture... This may take several minutes for long recordings."):
                         supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
                         whisper_model_type = supported_models[0]
                         
-                        result = transcribe_audio("recording.wav", whisper_model_type, "en", use_cache=False)
-                        st.session_state.question_text = result["text"]
-                        
-                        st.write(f"**Your question:** {st.session_state.question_text}")
-                        st.rerun()
-
-        else:
-            st.write(f"**Your question:** {st.session_state.question_text}")
-            if st.button("Record Again"):
-                del st.session_state.question_text
-                st.rerun()
-        
-        # Step 2: Get page number
-        if 'question_text' in st.session_state:
-            st.subheader("Step 2: Specify the page number")
-            
-            if 'page_number' not in st.session_state:
-                st.write("Say: the information is on page ...")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("Start Recording Page Number"):
-                        if st.session_state.recorder is None:
-                            st.session_state.recorder = AudioRecorder()
-                        st.session_state.recorder.start()
-                        st.session_state.recording_status = "recording_page"
-                        st.info("Recording page number...")
-
-                with col2:
-                    if st.button("Stop Recording Page Number"):
-                        if st.session_state.recorder and st.session_state.recording_status == "recording_page":
-                            st.session_state.recorder.stop("recording.wav")
-                            st.session_state.recording_status = "stopped"
-                            st.session_state.recorder = None
-                            st.success("Recording finished!")
-                            
-                            # Process the recording
-                            supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
-                            whisper_model_type = supported_models[0]
-                            
-                            result = transcribe_audio("recording.wav", whisper_model_type, "en", use_cache=False)
-                            page_text = result["text"]
-                            
-                            try:
-                                extracted_page = extract_number(page_text)
-                                if extracted_page and 1 <= extracted_page <= st.session_state.number_of_pages:
-                                    st.session_state.page_number = extracted_page
-                                    st.write(f"**Page number recognized:** {extracted_page}")
-                                    st.rerun()
-                                else:
-                                    st.error(f"Could not extract a valid page number from '{page_text}'")
-                            except:
-                                st.error("Failed to extract page number")
-                
-                # Alternative: manual page input
-                manual_page = st.number_input("Or enter page manually:", min_value=1, max_value=st.session_state.number_of_pages)
-                if st.button("Use This Page"):
-                    st.session_state.page_number = manual_page
-                    st.rerun()
-            else:
-                st.write(f"**Selected page:** {st.session_state.page_number}")
-                if st.button("Change Page"):
-                    del st.session_state.page_number
-                    st.rerun()
-        
-        # Step 3: Show results
-        if 'question_text' in st.session_state and 'page_number' in st.session_state:
-            st.subheader("Step 3: Get Answer")
-            
-            st.write(f"**Question:** {st.session_state.question_text}")
-            st.write(f"**Page:** {st.session_state.page_number}")
-            
-            if st.button("Get Answer"):
-                with st.spinner("Analyzing PDF..."):
-                    explanation = find_section_and_respond(client, st.session_state.question_text, st.session_state.page_number, 2)
-                
-                st.write("**Answer:**")
-                st.write(explanation)
-            
-            if st.button("Start Over"):
-                if 'question_text' in st.session_state:
-                    del st.session_state.question_text
-                if 'page_number' in st.session_state:
-                    del st.session_state.page_number
-                st.rerun()
-
-# Mode 4: Audio Analysis
-elif mode == "Audio Analysis (Mode 4)":
-    st.header("Audio Lecture Analysis")
-    
-    # Upload lecture audio
-    uploaded_lecture = st.file_uploader("Upload lecture audio", type=["wav", "mp3"])
-    
-    if uploaded_lecture:
-        # Save to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
-            tmp_file.write(uploaded_lecture.getvalue())
-            lecture_path = tmp_file.name
-        
-        if st.button("Analyze Lecture"):
-            # Process the lecture
-            with st.spinner("Transcribing lecture... This may take several minutes for long recordings."):
-                supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
-                whisper_model_type = supported_models[0]
-                
-                result = transcribe_audio(lecture_path, whisper_model_type, "en", use_cache=True)
-                lecture_text = result["text"]
-            
-            st.success("Transcription complete!")
-            
-            with st.spinner("Claude is analyzing the lecture content..."):
-                lp = get_long_prompt(lecture_text)
-                system_response = get_system_response(client, lp)
-            
-            # Save the analysis to HTML
-            html_file = save_to_html(system_response)
-            st.success(f"Analysis saved to {html_file}")
-            
-            # Display the analysis
-            st.subheader("Lecture Analysis")
-            st.write(system_response)
-            
-            # Provide download option
-            with open(html_file, "rb") as file:
-                st.download_button(
-                    label="Download HTML Analysis",
-                    data=file,
-                    file_name="lecture_analysis.html",
-                    mime="text/html"
-                )
+                        result = transcribe_audio(lecture_path, whisper_model_type, "en", use_cache=True)
+                        lecture_text = result["text"]
+                    
+                    st.success("Transcription complete!")
+                    
+                    with st.spinner("Claude is analyzing the lecture content..."):
+                        lp = get_long_prompt(lecture_text)
+                        system_response = get_system_response(client, lp)
+                    
+                    # Save the analysis to HTML
+                    html_file = save_to_html(system_response)
+                    st.success(f"Analysis saved to {html_file}")
+                    
+                    # Display the analysis
+                    st.subheader("Lecture Analysis")
+                    st.write(system_response)
+                    
+                    # Provide download option
+                    with open(html_file, "rb") as file:
+                        st.download_button(
+                            label="Download HTML Analysis",
+                            data=file,
+                            file_name="lecture_analysis.html",
+                            mime="text/html"
+                        )
 
 # Display conversation history
 st.sidebar.subheader("Conversation History")
