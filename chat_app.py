@@ -20,15 +20,16 @@ import keyboard
 
 #second change
 
+#https://docs.anthropic.com/en/docs/about-claude/models/overview
 client = Anthropic()
 
 # Define model options
 MODEL_OPTIONS = {
-    "Claude 3.5 Sonnet": "claude-3-5-sonnet-20241022",
     "Claude 3.5 Haiku": "claude-3-5-haiku-20241022",
     "Claude 3.7 Sonnet": "claude-3-7-sonnet-20250219", 
     "Claude Sonnet 4": "claude-sonnet-4-20250514", 
-    "Claude Opus 4": "claude-opus-4-20250514"
+    "Claude Opus 4": "claude-opus-4-20250514", 
+    "Cluade Opus 4.1": "claude-opus-4-1-20250805"
 }
 
 # Initialize MODEL_NAME in session state if not already present
@@ -164,7 +165,7 @@ def find_section_and_respond(client, simple_prompt, page_number, chunk_width):
 def get_system_response(client, simple_prompt):
     """Get standard response from Claude"""
     st.session_state.message_history.append({"role": 'user', "content": simple_prompt})
-    st.write("get_system_response 1")
+    
     
     try:
         response = client.messages.create(
@@ -174,10 +175,10 @@ def get_system_response(client, simple_prompt):
             system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts.",
             messages=st.session_state.message_history
         )
-        st.write("get_system_response 2")
+        
         
         result = response.content[0].text
-        st.write("get_system_response 3")
+        
         
         st.session_state.message_history.append({"role": 'assistant', "content": result})
         return result
