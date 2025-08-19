@@ -474,8 +474,8 @@ else:
                                             st.rerun()
                                         else:
                                             st.error(f"Could not extract a valid page number from '{page_text}'")
-                                    except:
-                                        st.error("Failed to extract page number")
+                                    except Exception as e:
+                                        st.error(f"Failed to process the page number. Error: {e}")
                         
                         # Alternative: manual page input
                         manual_page = st.number_input("Or enter page manually:", min_value=1, max_value=st.session_state.number_of_pages)
