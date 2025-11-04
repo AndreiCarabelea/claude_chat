@@ -17,6 +17,13 @@ import json
 import hashlib
 import tempfile
 import keyboard
+from langchain_openai import ChatOpenAI
+from dotenv import load_dotenv
+
+load_dotenv()  
+
+anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+grok_api_key = os.getenv("XAI_API_KEY") 
 
 #second change
 
@@ -24,20 +31,26 @@ import keyboard
 
 # Define model options
 MODEL_OPTIONS = {
-    "Claude 3.5 Haiku": "claude-3-5-haiku-20241022",
-    "Claude 3.7 Sonnet": "claude-3-7-sonnet-20250219", 
-    "Claude Sonnet 4": "claude-sonnet-4-20250514", 
-    "Claude Opus 4": "claude-opus-4-20250514", 
+    "Claude 4.5 Haiku": "claude-haiku-4-5-20251001",
+    "Claude 4.5 Sonnet": "claude-sonnet-4-5-20250929", 
     "Cluade Opus 4.1": "claude-opus-4-1-20250805"
 }
 
+GROK_MODELS = {
+    "Grok 3 mini": "grok-3-mini", 
+    "grok 4 fast-reasoning": "grok-4-fast-reasoning", 
+    "grok 4 fast-non-reasoning": "grok-4-fast-non-reasoning"
+    
+}
 # Initialize MODEL_NAME in session state if not already present
 if 'model_name' not in st.session_state:
-    st.session_state.model_name = MODEL_OPTIONS["Claude 3.5 Haiku"]  # Default model
+    st.session_state.model_name = MODEL_OPTIONS["Claude 4.5 Haiku"]  # Default model
 
 # Initialize session state variables
 if 'anthropic_api_key' not in st.session_state:
-    st.session_state.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+    st.session_state.anthropic_api_key = anthropic_api_key
+if 'xai_api_key' not in st.session_state:
+    st.session_state.xai_api_key = grok_api_key
 if 'message_history' not in st.session_state:
     st.session_state.message_history = []
 if 'pages_text' not in st.session_state:
@@ -112,7 +125,7 @@ def chunk_getter(page_number, chunk_width):
     # Get text from the range of pages
     return ' '.join(st.session_state.pages_text[start_page:end_page + 1])
 
-def get_completion_pdf(client, simple_prompt, page_number, chunk_width):
+def get_completion_pdf(anthropic_client, xai_client, simple_prompt, page_number, chunk_width):
     """Get completion from Claude for PDF content"""
     st.write(f"Analyzing pages around page {page_number} with width {chunk_width}")
     
@@ -126,16 +139,33 @@ def get_completion_pdf(client, simple_prompt, page_number, chunk_width):
     
     st.session_state.message_history.append({"role": 'user', "content": prompt})
     
-    response = client.messages.create(
-        model=st.session_state.model_name,
-        max_tokens=2048,
-        temperature=0.75,
-        system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts.",
-        messages=st.session_state.message_history
-    )
-    return response.content[0].text
+    # Determine which client to use
+    if st.session_state.model_name in MODEL_OPTIONS.values():
+        if not anthropic_client:
+            return "Anthropic client not initialized. Please check your API key."
+        response = anthropic_client.messages.create(
+            model=st.session_state.model_name,
+            max_tokens=2048,
+            temperature=0.75,
+            system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts.",
+            messages=st.session_state.message_history
+        )
+        return response.content[0].text
+    elif st.session_state.model_name in GROK_MODELS.values():
+        if not xai_client:
+            return "xAI client not initialized. Please check your API key."
+        # For Grok, the prompt needs to be wrapped for Langchain
+        from langchain_core.messages import HumanMessage, SystemMessage
+        messages = [
+            SystemMessage(content="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts."),
+            HumanMessage(content=prompt)
+        ]
+        response = xai_client.invoke(messages)
+        return response.content
+    else:
+        return "Selected model not supported."
 
-def find_section_and_respond(client, simple_prompt, page_number, chunk_width):
+def find_section_and_respond(anthropic_client, xai_client, simple_prompt, page_number, chunk_width):
     """Incrementally increase chunk width to find relevant content"""
     max_width = min(32, st.session_state.number_of_pages)  # Cap the maximum width
     attempts = 0
@@ -152,7 +182,7 @@ def find_section_and_respond(client, simple_prompt, page_number, chunk_width):
         time.sleep(1)  # Brief delay for UI update
         delta = random.uniform(-1, 1) * 0.1 * page_number
         
-        x_response = get_completion_pdf(client, simple_prompt, page_number + delta, chunk_width)
+        x_response = get_completion_pdf(anthropic_client, xai_client, simple_prompt, page_number + delta, chunk_width)
         
         if "None" not in x_response and len(x_response) > 300:
             st.success(f"Found relevant content with width: {chunk_width}")
@@ -168,23 +198,36 @@ def find_section_and_respond(client, simple_prompt, page_number, chunk_width):
     # If we get here, we couldn't find a good response
     return "Could not find relevant information in the specified section of the document."
 
-def get_system_response(client, simple_prompt):
+def get_system_response(anthropic_client, xai_client, simple_prompt):
     """Get standard response from Claude"""
     st.session_state.message_history.append({"role": 'user', "content": simple_prompt})
     
     
     try:
-        response = client.messages.create(
-            model=st.session_state.model_name,
-            max_tokens=2048,
-            temperature=0.75,
-            system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts.",
-            messages=st.session_state.message_history
-        )
-        
-        
-        result = response.content[0].text
-        
+        # Determine which client to use
+        if st.session_state.model_name in MODEL_OPTIONS.values():
+            if not anthropic_client:
+                return "Anthropic client not initialized. Please check your API key."
+            response = anthropic_client.messages.create(
+                model=st.session_state.model_name,
+                max_tokens=2048,
+                temperature=0.75,
+                system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts.",
+                messages=st.session_state.message_history
+            )
+            result = response.content[0].text
+        elif st.session_state.model_name in GROK_MODELS.values():
+            if not xai_client:
+                return "xAI client not initialized. Please check your API key."
+            from langchain_core.messages import HumanMessage, SystemMessage
+            messages = [
+                SystemMessage(content="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts."),
+                HumanMessage(content=simple_prompt)
+            ]
+            response = xai_client.invoke(messages)
+            result = response.content
+        else:
+            return "Selected model not supported."
         
         st.session_state.message_history.append({"role": 'assistant', "content": result})
         return result
@@ -245,7 +288,7 @@ with st.sidebar:
     st.header("Configuration")
     
     # API Key Management
-    if not st.session_state.get("anthropic_api_key"):
+    if not st.session_state.get("anthropic_api_key") and not st.session_state.get("xai_api_key"):
         st.warning("Anthropic API key not found!")
         api_key_input = st.text_input(
             "Enter your Anthropic API Key", 
@@ -260,8 +303,26 @@ with st.sidebar:
     else:
         st.success("Anthropic API key is set.")
 
-    selected_model = st.selectbox("Select AI Model", list(MODEL_OPTIONS.keys()), index=1)
-    st.session_state.model_name = MODEL_OPTIONS[selected_model]
+    # XAI API Key Management
+    if not st.session_state.get("xai_api_key"):
+        st.warning("XAI API key not found!")
+        xai_key_input = st.text_input(
+            "Enter your xAI API Key", 
+            type="password", 
+            key="xai_api_key_input",
+            help="You can find your API key on your xAI dashboard (e.g., Grok)."
+        )
+        if xai_key_input:
+            st.session_state.xai_api_key = xai_key_input
+            st.success("xAI API Key set for this session.")
+            st.rerun()
+    else:
+        st.success("xAI API key is set.")
+    
+    # Combine model options
+    ALL_MODEL_OPTIONS = {**MODEL_OPTIONS, **GROK_MODELS}
+    selected_model = st.selectbox("Select AI Model", list(ALL_MODEL_OPTIONS.keys()), index=0)
+    st.session_state.model_name = ALL_MODEL_OPTIONS[selected_model]
     
     # PDF Upload
     st.subheader("PDF Upload")
@@ -286,16 +347,29 @@ with st.sidebar:
         st.success("Conversation history cleared!")
 
 # Main app logic
-if not st.session_state.get("anthropic_api_key"):
-    st.error("Please enter your Anthropic API key in the sidebar to continue.")
+if not st.session_state.get("anthropic_api_key") and not st.session_state.get("xai_api_key"):
+    st.error("Please enter at least one API key (Anthropic or xAI) in the sidebar to continue.")
 else:
-    try:
-        client = Anthropic(api_key=st.session_state.anthropic_api_key)
-    except Exception as e:
-        st.error(f"Failed to initialize Anthropic client. Please check your API key. Error: {e}")
-        client = None
+    anthropic_client = None
+    xai_client = None
 
-    if client:
+    if st.session_state.get("anthropic_api_key"):
+        try:
+            anthropic_client = Anthropic(api_key=st.session_state.anthropic_api_key)
+        except Exception as e:
+            st.error(f"Failed to initialize Anthropic client. Please check your API key. Error: {e}")
+
+    if st.session_state.get("xai_api_key"):
+        try:
+            xai_client = ChatOpenAI(
+                openai_api_key=st.session_state.xai_api_key,
+                openai_api_base="https://api.x.ai/v1",
+                model=st.session_state.model_name # This will be updated in get_system_response
+            )
+        except Exception as e:
+            st.error(f"Failed to initialize xAI client. Please check your API key. Error: {e}")
+
+    if anthropic_client or xai_client:
         # Mode selection
         mode = st.selectbox(
             "Select Mode", 
@@ -315,9 +389,9 @@ else:
             if st.button("Send"):
                 if user_input:
                     st.write(f"**You:** {user_input}")
-                    with st.spinner("Claude is thinking..."):
-                        response = get_system_response(client, user_input)
-                    st.write(f"**Claude:** {response}")
+                    with st.spinner("AI is thinking..."):
+                        response = get_system_response(anthropic_client, xai_client, user_input)
+                    st.write(f"**AI:** {response}")
 
         # Mode 1: Audio Chat
         elif mode == "Audio Chat (Mode 1)":
@@ -355,8 +429,8 @@ else:
                             st.session_state.audio_chat_transcription = result["text"]
                             
                         # Get response from Claude
-                        with st.spinner("Claude is thinking..."):
-                            response = get_system_response(client, st.session_state.audio_chat_transcription)
+                        with st.spinner("AI is thinking..."):
+                            response = get_system_response(anthropic_client, xai_client, st.session_state.audio_chat_transcription)
                             st.session_state.audio_chat_response = response
 
                         st.rerun()
@@ -367,7 +441,7 @@ else:
             if st.session_state.audio_chat_transcription:
                 st.write(f"**You said:** {st.session_state.audio_chat_transcription}")
             if st.session_state.audio_chat_response:
-                st.write(f"**Claude:** {st.session_state.audio_chat_response}")
+                st.write(f"**AI:** {st.session_state.audio_chat_response}")
 
         # Mode 2: Text-PDF Analysis
         elif mode == "Text-PDF Analysis (Mode 2)":
@@ -385,7 +459,7 @@ else:
                 if st.button("Ask Question"):
                     if simple_prompt:
                         with st.spinner("Analyzing document..."):
-                            explanation = find_section_and_respond(client, simple_prompt, page_number, 2)
+                            explanation = find_section_and_respond(anthropic_client, xai_client, simple_prompt, page_number, 2)
                         st.write("**Answer:**")
                         st.write(explanation)
 
@@ -497,7 +571,7 @@ else:
                     
                     if st.button("Get Answer"):
                         with st.spinner("Analyzing PDF..."):
-                            explanation = find_section_and_respond(client, st.session_state.question_text, st.session_state.page_number, 2)
+                            explanation = find_section_and_respond(anthropic_client, xai_client, st.session_state.question_text, st.session_state.page_number, 2)
                         
                         st.write("**Answer:**")
                         st.write(explanation)
@@ -533,9 +607,9 @@ else:
                     
                     st.success("Transcription complete!")
                     
-                    with st.spinner("Claude is analyzing the lecture content..."):
+                    with st.spinner("AI is analyzing the lecture content..."):
                         lp = get_long_prompt(lecture_text)
-                        system_response = get_system_response(client, lp)
+                        system_response = get_system_response(anthropic_client, xai_client, lp)
                     
                     # Save the analysis to HTML
                     html_file = save_to_html(system_response)
