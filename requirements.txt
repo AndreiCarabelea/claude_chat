@@ -1,0 +1,8 @@
+streamlit>=1.28.0
+anthropic
+pypdf
+whisper-timestamped
+langdetect
+langchain-openai
+python-dotenv
+keyboard
