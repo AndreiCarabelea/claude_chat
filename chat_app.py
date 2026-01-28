@@ -19,11 +19,10 @@ import tempfile
 import keyboard
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
-
 load_dotenv()  
 
-anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-grok_api_key = os.getenv("XAI_API_KEY") 
+# API keys will be loaded from Streamlit Cloud secrets (environment variables)
+# No need to load .env file in deployment 
 
 #second change
 
@@ -31,26 +30,25 @@ grok_api_key = os.getenv("XAI_API_KEY")
 
 # Define model options
 MODEL_OPTIONS = {
-    "Claude 4.5 Haiku": "claude-haiku-4-5-20251001",
-    "Claude 4.5 Sonnet": "claude-sonnet-4-5-20250929", 
-    "Cluade Opus 4.1": "claude-opus-4-1-20250805"
+    "Claude Haiku 4.5": "claude-haiku-4-5-20251001",
+    "Claude Sonnet 4.5": "claude-sonnet-4-5-20250929", 
+    "Claude Opus 4.5": "claude-opus-4-5-20251101"
 }
 
 GROK_MODELS = {
-    "Grok 3 mini": "grok-3-mini", 
-    "grok 4 fast-reasoning": "grok-4-fast-reasoning", 
-    "grok 4 fast-non-reasoning": "grok-4-fast-non-reasoning"
-    
+    "Grok 3 Mini": "grok-3-mini",
+    "Grok 4.1 Fast Reason": "grok-4-1-fast-reasoning",
+    "Grok 4.1 Fast Non-Reason": "grok-4-1-fast-non-reasoning"
 }
 # Initialize MODEL_NAME in session state if not already present
 if 'model_name' not in st.session_state:
-    st.session_state.model_name = MODEL_OPTIONS["Claude 4.5 Haiku"]  # Default model
+    st.session_state.model_name = MODEL_OPTIONS["Claude Haiku 4.5"]  # Default model
 
 # Initialize session state variables
 if 'anthropic_api_key' not in st.session_state:
-    st.session_state.anthropic_api_key = anthropic_api_key
+    st.session_state.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 if 'xai_api_key' not in st.session_state:
-    st.session_state.xai_api_key = grok_api_key
+    st.session_state.xai_api_key = os.getenv("XAI_API_KEY")
 if 'message_history' not in st.session_state:
     st.session_state.message_history = []
 if 'pages_text' not in st.session_state:
@@ -281,7 +279,55 @@ def transcribe_audio(audio_file_path, model_type="base", language=None, use_cach
         return result
 
 # Main Streamlit app
-st.title("PDF and Audio Analysis App")
+st.title("Academic Learning Assistant")
+
+# Widen sidebar for better visibility and style main panel
+st.markdown(
+    """
+    <style>
+        section[data-testid="stSidebar"] > div {
+            width: 450px !important;
+        }
+        [data-testid="stSidebar"] {
+            width: 450px !important;
+        }
+        /* Light blue background for main panel */
+        .main {
+            background-color: #C5E3F6 !important;
+        }
+        .main .block-container {
+            background-color: #C5E3F6 !important;
+            padding: 2rem !important;
+            padding-top: 3rem !important;
+            border-radius: 10px !important;
+            margin-top: 1rem !important;
+        }
+        /* Adjust text color for better readability on light blue */
+        .main .block-container h1,
+        .main .block-container h2,
+        .main .block-container h3,
+        .main .block-container p,
+        .main .block-container label {
+            color: #1a1a1a !important;
+        }
+        /* Ensure the main content area has rounded corners */
+        .main > div:first-child {
+            border-radius: 10px !important;
+            overflow: hidden !important;
+        }
+        /* Apply rounded corners to the app view container */
+        [data-testid="stAppViewContainer"] > .main {
+            border-radius: 10px !important;
+            overflow: hidden !important;
+        }
+        /* Apply background and rounded corners to the entire main section */
+        section[data-testid="stAppViewContainer"] {
+            border-radius: 10px !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 # Sidebar for configuration
 with st.sidebar:
@@ -350,6 +396,11 @@ with st.sidebar:
 if not st.session_state.get("anthropic_api_key") and not st.session_state.get("xai_api_key"):
     st.error("Please enter at least one API key (Anthropic or xAI) in the sidebar to continue.")
 else:
+    # DEBUG: Log key status before client init
+    # st.sidebar.write("**DEBUG - API Key Status:**")
+    # st.sidebar.write(f"session anthropic_api_key: {'Present' if st.session_state.get('anthropic_api_key') else 'MISSING'}")
+    # st.sidebar.write(f"os.getenv('ANTHROPIC_API_KEY'): {'Present' if os.getenv('ANTHROPIC_API_KEY') else 'MISSING'}")
+    
     anthropic_client = None
     xai_client = None
 
@@ -382,7 +433,7 @@ else:
 
         # Mode 0: Text Chat
         if mode == "Text Chat (Mode 0)":
-            st.header("Text Chat")
+            st.header("General Conversation")
             
             user_input = st.text_area("Your message:")
             
@@ -634,6 +685,464 @@ if st.session_state.message_history:
     for i, msg in enumerate(st.session_state.message_history[-10:]):  # Show last 10 messages
         role = "👤 You" if msg["role"] == "user" else "🤖 Claude"
         st.sidebar.text(f"{role}: {msg['content'][:50]}...")
+       
+
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+       
+
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                    
+
+       
+
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
