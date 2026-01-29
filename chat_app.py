@@ -41,6 +41,9 @@ GROK_MODELS = {
     "Grok 4.1 Fast Reason": "grok-4-1-fast-reasoning",
     "Grok 4.1 Fast Non-Reason": "grok-4-1-fast-non-reasoning"
 }
+
+# Combine model options for easy reference
+ALL_MODEL_OPTIONS = {**MODEL_OPTIONS, **GROK_MODELS}
 # Initialize MODEL_NAME in session state if not already present
 if 'model_name' not in st.session_state:
     st.session_state.model_name = MODEL_OPTIONS["Claude Sonnet 4.5"]  # Default model
@@ -287,42 +290,42 @@ st.markdown("<h1 style='text-align: center;'></h1>", unsafe_allow_html=True)
 with st.sidebar:
     st.header("Configuration")
     
-    # API Key Management
-    if not st.session_state.get("anthropic_api_key") and not st.session_state.get("xai_api_key"):
-        st.warning("Anthropic API key not found!")
-        api_key_input = st.text_input(
-            "Enter your Anthropic API Key", 
-            type="password", 
-            key="api_key_input",
-            help="You can find your API key on your Anthropic dashboard."
-        )
-        if api_key_input:
-            st.session_state.anthropic_api_key = api_key_input
-            st.success("API Key set for this session.")
-            st.rerun()
-    else:
-        st.success("Anthropic API key is set.")
-
-    # XAI API Key Management
-    if not st.session_state.get("xai_api_key"):
-        st.warning("XAI API key not found!")
-        xai_key_input = st.text_input(
-            "Enter your xAI API Key", 
-            type="password", 
-            key="xai_api_key_input",
-            help="You can find your API key on your xAI dashboard (e.g., Grok)."
-        )
-        if xai_key_input:
-            st.session_state.xai_api_key = xai_key_input
-            st.success("xAI API Key set for this session.")
-            st.rerun()
-    else:
-        st.success("xAI API key is set.")
-    
-    # Combine model options
-    ALL_MODEL_OPTIONS = {**MODEL_OPTIONS, **GROK_MODELS}
-    selected_model = st.selectbox("Select AI Model", list(ALL_MODEL_OPTIONS.keys()), index=0)
+    selected_model = st.selectbox("Select AI Model", list(ALL_MODEL_OPTIONS.keys()), index=0, key="model_selector")
     st.session_state.model_name = ALL_MODEL_OPTIONS[selected_model]
+    
+    # Check if selected model is Anthropic and key is missing
+    if selected_model in MODEL_OPTIONS:
+        if not st.session_state.get("anthropic_api_key"):
+            st.info("Anthropic API key required for selected model")
+            api_key_input = st.text_input(
+                "Enter your Anthropic API Key", 
+                type="password", 
+                key="api_key_input",
+                help="You can find your API key on your Anthropic dashboard."
+            )
+            if api_key_input:
+                st.session_state.anthropic_api_key = api_key_input
+                st.success("Anthropic API Key set for this session.")
+                st.rerun()
+        else:
+            st.success("Anthropic API key is set.")
+    
+    # Check if selected model is Grok and key is missing
+    if selected_model in GROK_MODELS:
+        if not st.session_state.get("xai_api_key"):
+            st.info("xAI API key required for selected model")
+            xai_key_input = st.text_input(
+                "Enter your xAI API Key", 
+                type="password", 
+                key="xai_api_key_input",
+                help="You can find your API key on your xAI dashboard (e.g., Grok)."
+            )
+            if xai_key_input:
+                st.session_state.xai_api_key = xai_key_input
+                st.success("xAI API Key set for this session.")
+                st.rerun()
+        else:
+            st.success("xAI API key is set.")
     
     # PDF Upload
     st.subheader("PDF Upload")
@@ -347,8 +350,30 @@ with st.sidebar:
         st.success("Conversation history cleared!")
 
 # Main app logic
-if not st.session_state.get("anthropic_api_key") and not st.session_state.get("xai_api_key"):
-    st.error("Please enter at least one API key (Anthropic or xAI) in the sidebar to continue.")
+# Determine if the selected model requires a specific API key
+selected_model_name = None
+for name, value in ALL_MODEL_OPTIONS.items():
+    if value == st.session_state.model_name:
+        selected_model_name = name
+        break
+
+# Check if the selected model has the required API key
+can_proceed = True
+error_message = ""
+
+if selected_model_name in MODEL_OPTIONS:
+    # Check for Anthropic API key
+    if not st.session_state.get("anthropic_api_key"):
+        can_proceed = False
+        error_message = "Please enter an Anthropic API key in the sidebar to use the selected model."
+elif selected_model_name in GROK_MODELS:
+    # Check for xAI API key
+    if not st.session_state.get("xai_api_key"):
+        can_proceed = False
+        error_message = "Please enter an xAI API key in the sidebar to use the selected model."
+
+if not can_proceed:
+    st.error(error_message)
 else:
     anthropic_client = None
     xai_client = None
@@ -364,7 +389,7 @@ else:
             xai_client = ChatOpenAI(
                 openai_api_key=st.session_state.xai_api_key,
                 openai_api_base="https://api.x.ai/v1",
-                model=st.session_state.model_name # This will be updated in get_system_response
+                model=st.session_state.model_name
             )
         except Exception as e:
             st.error(f"Failed to initialize xAI client. Please check your API key. Error: {e}")
@@ -377,7 +402,8 @@ else:
              "Audio Chat (Mode 1)", 
              "Text-PDF Analysis (Mode 2)", 
              "Audio-PDF Analysis (Mode 3)", 
-             "Audio Analysis (Mode 4)"]
+             "Audio Analysis (Mode 4)"],
+            key="mode_selector"
         )
 
         # Mode 0: Text Chat
