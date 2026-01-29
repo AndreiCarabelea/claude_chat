@@ -126,7 +126,7 @@ def chunk_getter(page_number, chunk_width):
 
 def get_completion_pdf(anthropic_client, xai_client, simple_prompt, page_number, chunk_width):
     """Get completion from Claude for PDF content"""
-    st.write(f"Analyzing pages around page {page_number} with width {chunk_width}")
+    # st.write(f"Analyzing pages around page {page_number} with width {chunk_width}")
     
     text_chunk = chunk_getter(page_number, chunk_width)
             
@@ -176,7 +176,7 @@ def find_section_and_respond(anthropic_client, xai_client, simple_prompt, page_n
     while chunk_width <= max_width and attempts < max_attempts:
         progress = attempts / max_attempts
         progress_bar.progress(progress)
-        status_text.write(f"Attempt {attempts+1}/{max_attempts}: Checking with chunk width {chunk_width}")
+        # status_text.write(f"Attempt {attempts+1}/{max_attempts}: Checking with chunk width {chunk_width}")
         
         time.sleep(1)  # Brief delay for UI update
         delta = random.uniform(-1, 1) * 0.1 * page_number
@@ -280,7 +280,8 @@ def transcribe_audio(audio_file_path, model_type="base", language=None, use_cach
         return result
 
 # Main Streamlit app
-st.title("PDF and Audio Analysis App")
+st.title("Academic Learning Assistant")
+st.markdown("<h1 style='text-align: center;'></h1>", unsafe_allow_html=True)
 
 # Sidebar for configuration
 with st.sidebar:
