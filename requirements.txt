@@ -5,7 +5,6 @@ langchain_openai==1.1.7
 langdetect==1.0.9
 pypdf==6.6.2
 python-dotenv==1.2.1
-Requests==2.32.5
 streamlit==1.36.0
-streamlit-mic-recorder==0.0.8
+streamlit_mic_recorder==0.0.8
 whisper_timestamped==1.15.4
