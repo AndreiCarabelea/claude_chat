@@ -5,7 +5,6 @@ from functools import lru_cache
 from math import ceil, floor
 import time
 import random
-from record import AudioRecorder
 from html_generator import save_to_html
 import whisper_timestamped as whisper
 from langdetect import detect
@@ -16,7 +15,7 @@ import sys
 import json
 import hashlib
 import tempfile
-import keyboard
+from streamlit_mic_recorder import mic_recorder
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 
@@ -61,14 +60,14 @@ if 'number_of_pages' not in st.session_state:
     st.session_state.number_of_pages = 0
 if 'book_name' not in st.session_state:
     st.session_state.book_name = ""
-if 'recording_status' not in st.session_state:
-    st.session_state.recording_status = "stopped"
-if 'recorder' not in st.session_state:
-    st.session_state.recorder = None
 if 'audio_chat_transcription' not in st.session_state:
     st.session_state.audio_chat_transcription = None
 if 'audio_chat_response' not in st.session_state:
     st.session_state.audio_chat_response = None
+if 'audio_chat_wav_bytes' not in st.session_state:
+    st.session_state.audio_chat_wav_bytes = None
+if 'audio_chat_last_hash' not in st.session_state:
+    st.session_state.audio_chat_last_hash = None
 
 # Setup Anthropic client will be handled after we confirm the API key is set.
 
@@ -282,6 +281,29 @@ def transcribe_audio(audio_file_path, model_type="base", language=None, use_cach
         
         return result
 
+
+def _extract_wav_bytes(mic_output):
+    """Normalize output from streamlit-mic-recorder across versions."""
+    if mic_output is None:
+        return None
+    if isinstance(mic_output, (bytes, bytearray)):
+        return bytes(mic_output)
+    if isinstance(mic_output, dict):
+        # Known keys across different releases
+        for k in ("bytes", "audio_bytes", "data"):
+            v = mic_output.get(k)
+            if isinstance(v, (bytes, bytearray)):
+                return bytes(v)
+    return None
+
+
+def _write_wav_bytes_to_tempfile(wav_bytes, prefix="recording_"):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav", prefix=prefix)
+    tmp.write(wav_bytes)
+    tmp.flush()
+    tmp.close()
+    return tmp.name
+
 # Main Streamlit app
 st.title("Academic Learning Assistant")
 st.markdown("<h1 style='text-align: center;'></h1>", unsafe_allow_html=True)
@@ -423,47 +445,50 @@ else:
         elif mode == "Audio Chat (Mode 1)":
             st.header("Audio Chat")
             
-            st.write("Record your message:")
-            
-            col1, col2 = st.columns(2)
+            st.write("Record your message (uses your browser microphone):")
 
-            with col1:
-                if st.button("Start Recording"):
-                    # Clear previous results
+            mic_output = mic_recorder(
+                start_prompt="Start Recording",
+                stop_prompt="Stop Recording",
+                key="audio_chat_mic",
+            )
+
+            wav_bytes = _extract_wav_bytes(mic_output)
+            if wav_bytes:
+                audio_hash = hashlib.md5(wav_bytes).hexdigest()
+                if st.session_state.audio_chat_last_hash != audio_hash:
+                    # New recording captured
+                    st.session_state.audio_chat_last_hash = audio_hash
+                    st.session_state.audio_chat_wav_bytes = wav_bytes
                     st.session_state.audio_chat_transcription = None
                     st.session_state.audio_chat_response = None
-                    if st.session_state.recorder is None:
-                        st.session_state.recorder = AudioRecorder()
-                    st.session_state.recorder.start()
-                    st.session_state.recording_status = "recording"
-                    st.info("Recording... Click 'Stop Recording' to finish.")
 
-            with col2:
-                if st.button("Stop Recording"):
-                    if st.session_state.recorder and st.session_state.recording_status == "recording":
-                        st.session_state.recorder.stop("recording.wav")
-                        st.session_state.recording_status = "stopped"
-                        st.session_state.recorder = None  # Reset recorder
-                        st.success("Recording finished!")
-
-                        # Process the recording
+                    wav_path = _write_wav_bytes_to_tempfile(wav_bytes, prefix="audio_chat_")
+                    try:
                         with st.spinner("Transcribing..."):
                             supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
                             whisper_model_type = supported_models[1]
-                            
-                            result = transcribe_audio("recording.wav", whisper_model_type, "en", use_cache=False)
+                            result = transcribe_audio(wav_path, whisper_model_type, "en", use_cache=False)
                             st.session_state.audio_chat_transcription = result["text"]
-                            
-                        # Get response from Claude
-                        with st.spinner("AI is thinking..."):
-                            response = get_system_response(anthropic_client, xai_client, st.session_state.audio_chat_transcription)
-                            st.session_state.audio_chat_response = response
 
-                        st.rerun()
-                    else:
-                        st.warning("Not currently recording.")
+                        with st.spinner("AI is thinking..."):
+                            response = get_system_response(
+                                anthropic_client,
+                                xai_client,
+                                st.session_state.audio_chat_transcription,
+                            )
+                            st.session_state.audio_chat_response = response
+                    finally:
+                        try:
+                            os.remove(wav_path)
+                        except Exception:
+                            pass
+
+                    st.rerun()
 
             # Display the results full-width
+            if st.session_state.audio_chat_wav_bytes:
+                st.audio(st.session_state.audio_chat_wav_bytes, format="audio/wav")
             if st.session_state.audio_chat_transcription:
                 st.write(f"**You said:** {st.session_state.audio_chat_transcription}")
             if st.session_state.audio_chat_response:
@@ -502,32 +527,30 @@ else:
                 st.subheader("Step 1: Record your question")
                 
                 if 'question_text' not in st.session_state:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button("Start Recording Question"):
-                            if st.session_state.recorder is None:
-                                st.session_state.recorder = AudioRecorder()
-                            st.session_state.recorder.start()
-                            st.session_state.recording_status = "recording_question"
-                            st.info("Recording question...")
+                    mic_q = mic_recorder(
+                        start_prompt="Start Recording Question",
+                        stop_prompt="Stop Recording Question",
+                        key="pdf_question_mic",
+                    )
+                    wav_bytes_q = _extract_wav_bytes(mic_q)
+                    if wav_bytes_q:
+                        q_hash = hashlib.md5(wav_bytes_q).hexdigest()
+                        if st.session_state.get("pdf_question_last_hash") != q_hash:
+                            st.session_state.pdf_question_last_hash = q_hash
 
-                    with col2:
-                        if st.button("Stop Recording Question"):
-                            if st.session_state.recorder and st.session_state.recording_status == "recording_question":
-                                st.session_state.recorder.stop("recording.wav")
-                                st.session_state.recording_status = "stopped"
-                                st.session_state.recorder = None
-                                st.success("Recording finished!")
-                                
-                                # Process the recording
+                            wav_path = _write_wav_bytes_to_tempfile(wav_bytes_q, prefix="pdf_question_")
+                            try:
                                 supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
                                 whisper_model_type = supported_models[0]
-                                
-                                result = transcribe_audio("recording.wav", whisper_model_type, "en", use_cache=False)
+                                result = transcribe_audio(wav_path, whisper_model_type, "en", use_cache=False)
                                 st.session_state.question_text = result["text"]
-                                
-                                st.write(f"**Your question:** {st.session_state.question_text}")
-                                st.rerun()
+                            finally:
+                                try:
+                                    os.remove(wav_path)
+                                except Exception:
+                                    pass
+
+                            st.rerun()
 
                 else:
                     st.write(f"**Your question:** {st.session_state.question_text}")
@@ -541,42 +564,38 @@ else:
                     
                     if 'page_number' not in st.session_state:
                         st.write("Say: the information is on page ...")
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if st.button("Start Recording Page Number"):
-                                if st.session_state.recorder is None:
-                                    st.session_state.recorder = AudioRecorder()
-                                st.session_state.recorder.start()
-                                st.session_state.recording_status = "recording_page"
-                                st.info("Recording page number...")
 
-                        with col2:
-                            if st.button("Stop Recording Page Number"):
-                                if st.session_state.recorder and st.session_state.recording_status == "recording_page":
-                                    st.session_state.recorder.stop("recording.wav")
-                                    st.session_state.recording_status = "stopped"
-                                    st.session_state.recorder = None
-                                    st.success("Recording finished!")
-                                    
-                                    # Process the recording
+                        mic_p = mic_recorder(
+                            start_prompt="Start Recording Page Number",
+                            stop_prompt="Stop Recording Page Number",
+                            key="pdf_page_mic",
+                        )
+                        wav_bytes_p = _extract_wav_bytes(mic_p)
+                        if wav_bytes_p:
+                            p_hash = hashlib.md5(wav_bytes_p).hexdigest()
+                            if st.session_state.get("pdf_page_last_hash") != p_hash:
+                                st.session_state.pdf_page_last_hash = p_hash
+
+                                wav_path = _write_wav_bytes_to_tempfile(wav_bytes_p, prefix="pdf_page_")
+                                try:
                                     supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
                                     whisper_model_type = supported_models[0]
-                                    
-                                    result = transcribe_audio("recording.wav", whisper_model_type, "en", use_cache=False)
+
+                                    result = transcribe_audio(wav_path, whisper_model_type, "en", use_cache=False)
                                     page_text = result["text"]
-                                    
+
+                                    extracted_page = extract_number(page_text)
+                                    if extracted_page and 1 <= extracted_page <= st.session_state.number_of_pages:
+                                        st.session_state.page_number = extracted_page
+                                        st.rerun()
+                                    else:
+                                        st.error(f"Could not extract a valid page number from '{page_text}'")
+                                finally:
                                     try:
-                                        extracted_page = extract_number(page_text)
-                                        if extracted_page and 1 <= extracted_page <= st.session_state.number_of_pages:
-                                            st.session_state.page_number = extracted_page
-                                            st.write(f"**Page number recognized:** {extracted_page}")
-                                            st.rerun()
-                                        else:
-                                            st.error(f"Could not extract a valid page number from '{page_text}'")
-                                    except Exception as e:
-                                        st.error(f"Failed to process the page number. Error: {e}")
-                        
+                                        os.remove(wav_path)
+                                    except Exception:
+                                        pass
+                         
                         # Alternative: manual page input
                         manual_page = st.number_input("Or enter page manually:", min_value=1, max_value=st.session_state.number_of_pages)
                         if st.button("Use This Page"):
