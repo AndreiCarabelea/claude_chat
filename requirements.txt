@@ -7,4 +7,7 @@ pypdf==6.6.2
 python-dotenv==1.2.1
 streamlit==1.36.0
 streamlit_mic_recorder==0.0.8
-whisper_timestamped==1.15.4
+whisper_timestamped==1.15.9
+llvmlite>=0.46.0
+numba==0.63.1
+rich<14

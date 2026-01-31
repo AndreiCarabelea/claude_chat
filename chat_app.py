@@ -267,14 +267,40 @@ def transcribe_audio(audio_file_path, model_type="base", language=None, use_cach
     # If not cached or caching disabled, perform the transcription
     with st.spinner(f"Transcribing {os.path.basename(audio_file_path)}..."):
         audio = whisper.load_audio(audio_file_path)
+        st.write(f"Debug: audio length {len(audio)}, duration {len(audio)/16000:.2f}s")
         
-        # Ensure model is loaded
-        whisper_model = whisper.load_model(model_type, device="cpu")
+        # If audio is too short, return empty transcription to avoid whisper errors
+        if len(audio) < 8000:  # less than 0.5 seconds
+            st.warning("Audio too short, skipping transcription.")
+            return {"text": "", "segments": []}
+        
+        # Ensure model is loaded with retry for tokenizer download issues
+        max_attempts = 3
+        whisper_model = None
+        for attempt in range(max_attempts):
+            try:
+                whisper_model = whisper.load_model(model_type, device="cpu")
+                break
+            except RuntimeError as e:
+                if "Failed to load tokenizer" in str(e) and attempt < max_attempts - 1:
+                    st.warning(f"Tokenizer loading failed, retrying... ({attempt + 1}/{max_attempts})")
+                    time.sleep(2 ** attempt)  # exponential backoff
+                else:
+                    raise
         
         # Perform transcription
-        result = whisper.transcribe(whisper_model, audio, language=language)
-        
-        # Cache the result if caching is enabled
+        try:
+            result = whisper.transcribe(whisper_model, audio, language=language,
+                                        compute_word_confidence=True,
+                                        no_speech_threshold=0.6)
+        except IndexError as e:
+            st.error(f"IndexError in whisper_timestamped: {e}")
+            st.write(f"Audio length: {len(audio)}, duration: {len(audio)/16000:.2f}s")
+            import traceback
+            st.write(f"Traceback: {traceback.format_exc()}")
+            raise
+
+# Cache the result if caching is enabled
         if use_cache:
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
