@@ -467,7 +467,7 @@ else:
                     try:
                         with st.spinner("Transcribing..."):
                             supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
-                            whisper_model_type = supported_models[1]
+                            whisper_model_type = supported_models[0]
                             result = transcribe_audio(wav_path, whisper_model_type, "en", use_cache=False)
                             st.session_state.audio_chat_transcription = result["text"]
 
