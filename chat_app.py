@@ -239,6 +239,114 @@ def get_system_response(anthropic_client, xai_client, simple_prompt):
         st.write(f"Traceback: {traceback.format_exc()}")
         return "An error occurred while processing your request."
 
+
+def get_pdf_summary(anthropic_client, xai_client, start_page, end_page, percentage):
+    """
+    Summarize a range of pages from the PDF using dynamic chunking.
+    Chunk size is calculated based on text density and target summary percentage 
+    to ensure the model's output token limit is respected.
+    """
+    
+    # 1. Calculate optimal chunk size
+    # Target: Ensure output summary fits within a safe token limit (e.g., 2000 tokens)
+    # Rationale: 
+    # - Max output tokens is typically 4096.
+    # - We want to be safe (2000) to allow for reasoning and formatting.
+    # - Formula: Input_Tokens * Percentage = Output_Tokens
+    # - So: Max_Input_Tokens = Safe_Output_Tokens / Percentage
+    
+    SAFE_OUTPUT_TOKENS = 2000
+    SAFE_OUTPUT_CHARS = SAFE_OUTPUT_TOKENS * 4  # Approx 4 chars per token
+    
+    target_input_chars = SAFE_OUTPUT_CHARS / (percentage / 100)
+    
+    # Calculate average chars per page in the selected range to estimate density
+    total_chars = 0
+    range_pages = st.session_state.pages_text[start_page-1:end_page]
+    valid_pages = 0
+    for p_text in range_pages:
+        if p_text:
+            total_chars += len(p_text)
+            valid_pages += 1
+    
+    avg_chars_per_page = total_chars / valid_pages if valid_pages > 0 else 1000 # Default fallback
+    
+    # Determine chunk size (number of pages)
+    # We want: Chunk_Size * Avg_Chars_Page <= Target_Input_Chars
+    calculated_chunk_size = int(target_input_chars / avg_chars_per_page)
+    
+    # Clamp chunk size to reasonable limits (1 to 10 pages)
+    # 1 page minimum. 10 pages max to avoid context window issues or very long processing.
+    CHUNK_SIZE = max(1, min(10, calculated_chunk_size))
+    
+    # Chunk configuration
+    page_chunks = []
+    for i in range(start_page, end_page + 1, CHUNK_SIZE):
+        chunk_end = min(i + CHUNK_SIZE - 1, end_page)
+        page_chunks.append((i, chunk_end))
+    
+    st.session_state.message_history.append({"role": 'user', "content": f"Summarize pages {start_page}-{end_page} ({percentage}%) - Dynamic Chunk Size: {CHUNK_SIZE}"})
+    
+    system_msg = "You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical content, focus on general formulas and symbolic representations rather than specific numerical calculations."
+    full_summary = []
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total_chunks = len(page_chunks)
+
+    try:
+        for idx, (chunk_start, chunk_end) in enumerate(page_chunks):
+            status_text.write(f"Summarizing pages {chunk_start}-{chunk_end} (Chunk {idx+1}/{total_chunks}, Size: {CHUNK_SIZE})...")
+            
+            # Extract text for this chunk
+            text_chunk = ' '.join(st.session_state.pages_text[chunk_start-1:chunk_end])
+            
+            prompt = (f"Please provide a detailed summary of the following academic text from pages {chunk_start} to {chunk_end}. "
+                      f"The summary should be approximately {percentage}% of the original length. "
+                      "Focus on keeping the main concepts and skipping irrelevant factual data. "
+                      "When encountering formulas or mathematical derivations, ignore specific numerical calculations and instead represent the general formula or symbolic representation.\n\n"
+                      f"<text>{text_chunk}</text>")
+            
+            # Determine which client to use
+            if st.session_state.model_name in MODEL_OPTIONS.values():
+                if not anthropic_client:
+                    return "Anthropic client not initialized. Please check your API key."
+                response = anthropic_client.messages.create(
+                    model=st.session_state.model_name,
+                    max_tokens=4096,
+                    temperature=0.75,
+                    system=system_msg,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                chunk_result = response.content[0].text
+            elif st.session_state.model_name in GROK_MODELS.values():
+                if not xai_client:
+                    return "xAI client not initialized. Please check your API key."
+                from langchain_core.messages import HumanMessage, SystemMessage
+                messages = [
+                    SystemMessage(content=system_msg),
+                    HumanMessage(content=prompt)
+                ]
+                response = xai_client.invoke(messages)
+                chunk_result = response.content
+            else:
+                return "Selected model not supported."
+            
+            full_summary.append(chunk_result)
+            progress_bar.progress((idx + 1) / total_chunks)
+        
+        status_text.empty()
+        progress_bar.empty()
+        
+        final_result = "\n\n".join(full_summary)
+        st.session_state.message_history.append({"role": 'assistant', "content": final_result})
+        return final_result
+
+    except Exception as e:
+        st.error(f"Error in get_pdf_summary: {str(e)}")
+        return "An error occurred while generating the summary."
+
+
 def get_audio_hash(audio_file_path):
     """Generate a hash of the audio file for caching purposes"""
     with open(audio_file_path, 'rb') as f:
@@ -450,7 +558,8 @@ else:
              "Audio Chat (Mode 1)", 
              "Text-PDF Analysis (Mode 2)", 
              "Audio-PDF Analysis (Mode 3)", 
-             "Audio Analysis (Mode 4)"],
+             "Audio Analysis (Mode 4)",
+             "Summarizing (Mode 5)"],
             key="mode_selector"
         )
 
@@ -698,6 +807,45 @@ else:
                             file_name="lecture_analysis.html",
                             mime="text/html"
                         )
+
+        # Mode 5: Summarizing
+        elif mode == "Summarizing (Mode 5)":
+            st.header("Summarizing")
+            
+            if not st.session_state.pages_text:
+                st.warning("Please upload a PDF document in the sidebar first.")
+            else:
+                st.write(f"Currently summarizing: {st.session_state.book_name}")
+                st.write(f"Document has {st.session_state.number_of_pages} pages")
+                
+                # Input for page range
+                page_range = st.text_input("Enter page range (e.g. 2-12):", value=f"1-{st.session_state.number_of_pages}")
+                
+                # Input for percentage
+                percentage = st.slider("Select summary percentage:", min_value=10, max_value=90, value=30, step=5)
+                
+                if st.button("Summarize"):
+                    # Parse page range
+                    try:
+                        if '-' in page_range:
+                            parts = page_range.split('-')
+                            if len(parts) == 2:
+                                start_p = int(parts[0].strip())
+                                end_p = int(parts[1].strip())
+                                
+                                if start_p < 1 or end_p > st.session_state.number_of_pages or start_p > end_p:
+                                    st.error(f"Invalid page range. Please enter values between 1 and {st.session_state.number_of_pages}.")
+                                else:
+                                    with st.spinner("Generating summary..."):
+                                        summary = get_pdf_summary(anthropic_client, xai_client, start_p, end_p, percentage)
+                                    st.subheader("Summary")
+                                    st.write(summary)
+                            else:
+                                st.error("Please use 'start-end' format for page range.")
+                        else:
+                            st.error("Please use 'start-end' format for page range (e.g., 2-12).")
+                    except ValueError:
+                        st.error("Please enter valid numbers for the page range.")
 
 # Display conversation history
 st.sidebar.subheader("Conversation History")
