@@ -347,6 +347,198 @@ def get_pdf_summary(anthropic_client, xai_client, start_page, end_page, percenta
         return "An error occurred while generating the summary."
 
 
+def parse_page_ranges(page_range_text: str, max_pages: int):
+    """Parse a page selection string into a merged list of (start_page, end_page).
+
+    Supported formats:
+    - Single range: "2-12"
+    - Disjoint ranges / singles: "1-2, 4, 6-8"
+
+    Returns:
+        List[Tuple[int, int]] sorted and merged (overlapping/adjacent ranges are merged).
+    """
+
+    text = "" if page_range_text is None else str(page_range_text).strip()
+    if not text:
+        raise ValueError("Please enter page ranges (e.g., 1-2, 4, 6-8).")
+
+    # Split on commas/newlines; allow whitespace around separators.
+    raw_parts = [p.strip() for p in re.split(r"[\n,]+", text) if p.strip()]
+    if not raw_parts:
+        raise ValueError("Please enter page ranges (e.g., 1-2, 4, 6-8).")
+
+    parsed = []
+    for part in raw_parts:
+        # Accept either "N" or "A-B" (exactly one hyphen).
+        if "-" in part:
+            pieces = [x.strip() for x in part.split("-")]
+            if len(pieces) != 2 or not pieces[0] or not pieces[1]:
+                raise ValueError(
+                    f"Invalid range '{part}'. Use formats like 2-12 or 1-2, 4, 6-8."
+                )
+            a_str, b_str = pieces
+        else:
+            a_str = b_str = part.strip()
+
+        try:
+            a = int(a_str)
+            b = int(b_str)
+        except ValueError:
+            raise ValueError(
+                f"Invalid page number in '{part}'. Use formats like 2-12 or 1-2, 4, 6-8."
+            )
+
+        if a < 1 or b < 1 or a > max_pages or b > max_pages:
+            raise ValueError(
+                f"Invalid page range. Please enter values between 1 and {max_pages}."
+            )
+        if a > b:
+            raise ValueError(
+                f"Invalid range '{part}'. Start page must be <= end page."
+            )
+
+        parsed.append((a, b))
+
+    parsed.sort(key=lambda x: (x[0], x[1]))
+
+    # Merge overlapping or adjacent ranges to reduce repeated work.
+    merged = []
+    for a, b in parsed:
+        if not merged or a > merged[-1][1] + 1:
+            merged.append([a, b])
+        else:
+            merged[-1][1] = max(merged[-1][1], b)
+
+    return [(a, b) for a, b in merged]
+
+
+def get_pdf_formula_summary(anthropic_client, xai_client, start_page, end_page):
+    """Extract formulas/equations from a PDF page range with short explanations.
+
+    Notes:
+    - This is intentionally NOT a narrative summary.
+    - Output should contain only formulas/equations (as faithfully as possible from extracted text)
+      and a short explanation for each.
+    """
+
+    # Chunking: aim to keep each request within a safe input size.
+    SAFE_INPUT_TOKENS = 12000
+    SAFE_INPUT_CHARS = SAFE_INPUT_TOKENS * 4  # ~4 chars per token heuristic
+
+    range_pages = st.session_state.pages_text[start_page - 1 : end_page]
+    total_chars = sum(len(p or "") for p in range_pages)
+    valid_pages = sum(1 for p in range_pages if p)
+    avg_chars_per_page = total_chars / valid_pages if valid_pages else 1000
+
+    calculated_chunk_size = int(SAFE_INPUT_CHARS / max(1, avg_chars_per_page))
+    CHUNK_SIZE = max(1, min(8, calculated_chunk_size))
+
+    page_chunks = []
+    for i in range(start_page, end_page + 1, CHUNK_SIZE):
+        chunk_end = min(i + CHUNK_SIZE - 1, end_page)
+        page_chunks.append((i, chunk_end))
+
+    st.session_state.message_history.append(
+        {
+            "role": "user",
+            "content": f"Formula_Summarizing pages {start_page}-{end_page} (Chunk Size: {CHUNK_SIZE})",
+        }
+    )
+
+    system_msg = (
+        "You are a university teacher. Extract only mathematical formulas/equations from the provided text. "
+        "Ignore purely numerical computations (e.g., 12/3=4, plugging numbers into a formula, arithmetic steps). "
+        "Include ONLY symbolic formulas that contain variables/parameters (letters or Greek symbols). "
+        "For each formula, provide a very short explanation (1 sentence). "
+        "Do not write a general summary. Do not include a compression ratio. "
+        "If the text contains no explicit formulas/equations, respond with: 'No formulas found.'"
+    )
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total_chunks = len(page_chunks)
+    results = []
+
+    try:
+        for idx, (chunk_start, chunk_end) in enumerate(page_chunks):
+            status_text.write(
+                f"Extracting formulas from pages {chunk_start}-{chunk_end} (Chunk {idx+1}/{total_chunks}, Size: {CHUNK_SIZE})..."
+            )
+
+            text_chunk = " ".join(st.session_state.pages_text[chunk_start - 1 : chunk_end])
+
+            prompt = (
+                f"From pages {chunk_start} to {chunk_end}, extract ONLY formulas/equations that appear in the text. "
+                "EXCLUDE purely numerical calculations; INCLUDE ONLY symbolic formulas with variables/parameters. "
+                "Return a bullet list. Each bullet must be: - **Formula:** <formula> — <1 short sentence explanation>. "
+                "If the formula is not cleanly readable, reconstruct it as best as possible, using standard mathematical notation. "
+                "Do not include any other commentary, preface, or summary.\n\n"
+                f"<text>{text_chunk}</text>"
+            )
+
+            if st.session_state.model_name in MODEL_OPTIONS.values():
+                if not anthropic_client:
+                    return "Anthropic client not initialized. Please check your API key."
+                response = anthropic_client.messages.create(
+                    model=st.session_state.model_name,
+                    max_tokens=1200,
+                    temperature=0.2,
+                    system=system_msg,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                chunk_result = response.content[0].text
+            elif st.session_state.model_name in GROK_MODELS.values():
+                if not xai_client:
+                    return "xAI client not initialized. Please check your API key."
+                from langchain_core.messages import HumanMessage, SystemMessage
+
+                messages = [SystemMessage(content=system_msg), HumanMessage(content=prompt)]
+                response = xai_client.invoke(messages)
+                chunk_result = response.content
+            else:
+                return "Selected model not supported."
+
+            chunk_text = (chunk_result or "").strip()
+
+            # Avoid repeating this across chunks; emit only if nothing is found overall.
+            if chunk_text and chunk_text != "No formulas found.":
+                # Best-effort post-filtering to drop bullets that are purely numeric.
+                kept_lines = []
+                for line in chunk_text.splitlines():
+                    if "Formula" in line:
+                        after = line.split("**Formula:**", 1)[-1].strip() if "**Formula:**" in line else line
+                        formula_part = after
+                        for sep in (" — ", " – ", " - "):
+                            if sep in after:
+                                formula_part = after.split(sep, 1)[0].strip()
+                                break
+                        if any(ch.isalpha() for ch in formula_part):
+                            kept_lines.append(line)
+                    else:
+                        # Keep non-empty continuation lines only if they contain alphabetic symbols.
+                        if line.strip() and any(ch.isalpha() for ch in line):
+                            kept_lines.append(line)
+
+                filtered = "\n".join(kept_lines).strip()
+                if filtered:
+                    results.append(filtered)
+            progress_bar.progress((idx + 1) / total_chunks)
+
+        status_text.empty()
+        progress_bar.empty()
+
+        if not results:
+            final_result = "No formulas found."
+        else:
+            final_result = "\n\n".join(results).strip()
+        st.session_state.message_history.append({"role": "assistant", "content": final_result})
+        return final_result
+
+    except Exception as e:
+        st.error(f"Error in get_pdf_formula_summary: {str(e)}")
+        return "An error occurred while extracting formulas."
+
+
 def get_audio_hash(audio_file_path):
     """Generate a hash of the audio file for caching purposes"""
     with open(audio_file_path, 'rb') as f:
@@ -559,7 +751,8 @@ else:
              "Text-PDF Analysis (Mode 2)", 
              "Audio-PDF Analysis (Mode 3)", 
              "Audio Analysis (Mode 4)",
-             "Summarizing (Mode 5)"],
+             "Summarizing (Mode 5)",
+             "Formula_Summarizing (Mode 6)"],
             key="mode_selector"
         )
 
@@ -818,34 +1011,84 @@ else:
                 st.write(f"Currently summarizing: {st.session_state.book_name}")
                 st.write(f"Document has {st.session_state.number_of_pages} pages")
                 
-                # Input for page range
-                page_range = st.text_input("Enter page range (e.g. 2-12):", value=f"1-{st.session_state.number_of_pages}")
+                # Input for page ranges
+                page_range = st.text_input("Enter page ranges (e.g. 1-2, 4, 6-8):", value=f"1-{st.session_state.number_of_pages}")
                 
                 # Input for percentage
                 percentage = st.slider("Select summary percentage:", min_value=10, max_value=90, value=30, step=5)
                 
                 if st.button("Summarize"):
-                    # Parse page range
                     try:
-                        if '-' in page_range:
-                            parts = page_range.split('-')
-                            if len(parts) == 2:
-                                start_p = int(parts[0].strip())
-                                end_p = int(parts[1].strip())
+                        ranges = parse_page_ranges(page_range, st.session_state.number_of_pages)
+                        
+                        combined_sections = []
+                        with st.spinner("Generating summary..."):
+                            for start_p, end_p in ranges:
+                                summary = get_pdf_summary(anthropic_client, xai_client, start_p, end_p, percentage)
                                 
-                                if start_p < 1 or end_p > st.session_state.number_of_pages or start_p > end_p:
-                                    st.error(f"Invalid page range. Please enter values between 1 and {st.session_state.number_of_pages}.")
+                                if len(ranges) > 1:
+                                    combined_sections.append(f"#### Pages {start_p}-{end_p}\n\n{summary}")
                                 else:
-                                    with st.spinner("Generating summary..."):
-                                        summary = get_pdf_summary(anthropic_client, xai_client, start_p, end_p, percentage)
-                                    st.subheader("Summary")
-                                    st.write(summary)
-                            else:
-                                st.error("Please use 'start-end' format for page range.")
-                        else:
-                            st.error("Please use 'start-end' format for page range (e.g., 2-12).")
-                    except ValueError:
-                        st.error("Please enter valid numbers for the page range.")
+                                    combined_sections.append(summary)
+                        
+                        final_summary = "\n\n".join(combined_sections).strip()
+                        st.subheader("Summary")
+                        st.markdown(final_summary)
+                    except ValueError as e:
+                        st.error(str(e) or "Please enter valid page ranges.")
+
+        # Mode 6: Formula_Summarizing
+        elif mode == "Formula_Summarizing (Mode 6)":
+            st.header("Formula_Summarizing")
+
+            if not st.session_state.pages_text:
+                st.warning("Please upload a PDF document in the sidebar first.")
+            else:
+                st.write(f"Currently extracting formulas from: {st.session_state.book_name}")
+                st.write(f"Document has {st.session_state.number_of_pages} pages")
+
+                page_range = st.text_input(
+                    "Enter page ranges (e.g. 1-2, 4, 6-8):",
+                    value=f"1-{st.session_state.number_of_pages}",
+                    key="formula_page_range",
+                )
+
+                if st.button("Extract Formulas"):
+                    try:
+                        ranges = parse_page_ranges(
+                            page_range, st.session_state.number_of_pages
+                        )
+
+                        combined_sections = []
+                        with st.spinner("Extracting formulas..."):
+                            for start_p, end_p in ranges:
+                                formulas = get_pdf_formula_summary(
+                                    anthropic_client,
+                                    xai_client,
+                                    start_p,
+                                    end_p,
+                                )
+
+                                if (formulas or "").strip() == "No formulas found.":
+                                    continue
+
+                                if len(ranges) > 1:
+                                    combined_sections.append(
+                                        f"#### Pages {start_p}-{end_p}\n\n{formulas}"
+                                    )
+                                else:
+                                    combined_sections.append(formulas)
+
+                        final_formulas = (
+                            "No formulas found."
+                            if not combined_sections
+                            else "\n\n".join(combined_sections).strip()
+                        )
+
+                        st.subheader("Formulas")
+                        st.markdown(final_formulas)
+                    except ValueError as e:
+                        st.error(str(e) or "Please enter valid page ranges.")
 
 # Display conversation history
 st.sidebar.subheader("Conversation History")
