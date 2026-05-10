@@ -1,3 +1,5 @@
+import os
+import tempfile
 import time
 import re
 
@@ -183,7 +185,7 @@ def _parse_section_heading(text: str):
     title = (m.group(2) or "").strip() or "Untitled"
     return m.group(1), title
 
-def save_to_html(system_response):
+def save_to_html(system_response, output_dir=None):
     """
     Save the system response to a simple HTML file with a working table of contents.
     """
@@ -514,10 +516,17 @@ def save_to_html(system_response):
         '</html>'
     ])
     
-    # Write to file
-    with open('audio_demo.html', 'w', encoding='utf-8') as f:
-        f.write('\n'.join(html_parts))
-    
-    print("Analysis saved to audio_demo.html")
+    # Write to a managed temp file so it can be downloaded and removed safely.
+    target_dir = output_dir or os.path.join(tempfile.gettempdir(), "academic_learning_assistant")
+    os.makedirs(target_dir, exist_ok=True)
 
-    return 'audio_demo.html'
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".html",
+        prefix="analysis_",
+        dir=target_dir,
+        mode="w",
+        encoding="utf-8",
+    ) as f:
+        f.write('\n'.join(html_parts))
+        return f.name

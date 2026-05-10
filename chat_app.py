@@ -15,6 +15,8 @@ import sys
 import json
 import hashlib
 import tempfile
+import uuid
+from datetime import datetime, timedelta, timezone
 from streamlit_mic_recorder import mic_recorder
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
@@ -23,6 +25,12 @@ load_dotenv()
 
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 grok_api_key = os.getenv("XAI_API_KEY") 
+
+APP_TEMP_DIR = os.path.join(tempfile.gettempdir(), "academic_learning_assistant")
+TEMP_FILE_MAX_AGE_SECONDS = 60 * 60 * 6
+USER_ACCESS_FILE = os.path.join(os.path.dirname(__file__), "user_access.json")
+TRIAL_DAYS = 15
+PAYPAL_DONATE_URL = os.getenv("PAYPAL_DONATE_URL", "")
 
 #second change
 
@@ -211,6 +219,187 @@ if 'last_response_cost' not in st.session_state:
     st.session_state.last_response_cost = None
 
 # Setup Anthropic client will be handled after we confirm the API key is set.
+
+
+def _ensure_app_temp_dir():
+    os.makedirs(APP_TEMP_DIR, exist_ok=True)
+    return APP_TEMP_DIR
+
+
+def _safe_remove_file(file_path):
+    if not file_path:
+        return
+    try:
+        os.remove(file_path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def _purge_stale_temp_files(max_age_seconds=TEMP_FILE_MAX_AGE_SECONDS):
+    temp_dir = _ensure_app_temp_dir()
+    cutoff = time.time() - max_age_seconds
+
+    for entry in os.scandir(temp_dir):
+        if not entry.is_file():
+            continue
+        try:
+            if entry.stat().st_mtime < cutoff:
+                os.remove(entry.path)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+
+
+_purge_stale_temp_files()
+
+
+def _utcnow_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_utc(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def _detect_device_type(user_agent):
+    ua = (user_agent or "").lower()
+    if any(token in ua for token in ["mobile", "iphone", "android"]):
+        return "mobile"
+    if any(token in ua for token in ["ipad", "tablet"]):
+        return "tablet"
+    return "desktop"
+
+
+def _get_header_value(headers, key_name):
+    if not headers:
+        return ""
+    for key, value in headers.items():
+        if str(key).lower() == key_name.lower():
+            return str(value)
+    return ""
+
+
+def _get_client_context():
+    context = getattr(st, "context", None)
+    headers = getattr(context, "headers", {}) if context else {}
+
+    forwarded_for = _get_header_value(headers, "x-forwarded-for")
+    real_ip = _get_header_value(headers, "x-real-ip")
+    remote_addr = _get_header_value(headers, "remote-addr")
+    ip = (forwarded_for.split(",")[0].strip() if forwarded_for else "") or real_ip or remote_addr or "unknown-ip"
+
+    user_agent = _get_header_value(headers, "user-agent") or "unknown-agent"
+    device_type = _detect_device_type(user_agent)
+
+    qp = st.query_params
+    browser_cookie = qp.get("vid", "")
+    if not browser_cookie:
+        browser_cookie = uuid.uuid4().hex
+        st.query_params["vid"] = browser_cookie
+
+    return {
+        "ip": ip,
+        "user_agent": user_agent,
+        "device_type": device_type,
+        "browser_cookie": browser_cookie,
+    }
+
+
+def _build_user_id(client_ctx):
+    raw = f"{client_ctx['ip']}|{client_ctx['device_type']}|{client_ctx['browser_cookie']}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _load_access_data():
+    if not os.path.exists(USER_ACCESS_FILE):
+        return {"users": {}}
+    try:
+        with open(USER_ACCESS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("users"), dict):
+                return data
+    except Exception:
+        pass
+    return {"users": {}}
+
+
+def _save_access_data(data):
+    with open(USER_ACCESS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def _get_or_create_user_record(user_id, client_ctx):
+    data = _load_access_data()
+    users = data.setdefault("users", {})
+    now_iso = _utcnow_iso()
+
+    if user_id not in users:
+        users[user_id] = {
+            "created_at": now_iso,
+            "trial_started_at": now_iso,
+            "trial_days": TRIAL_DAYS,
+            "donation_unlocked": False,
+            "donation_unlocked_at": None,
+            "last_seen_at": now_iso,
+            "ip": client_ctx["ip"],
+            "device_type": client_ctx["device_type"],
+            "browser_cookie": client_ctx["browser_cookie"],
+            "user_agent": client_ctx["user_agent"],
+        }
+    else:
+        users[user_id]["last_seen_at"] = now_iso
+        users[user_id]["ip"] = client_ctx["ip"]
+        users[user_id]["device_type"] = client_ctx["device_type"]
+        users[user_id]["browser_cookie"] = client_ctx["browser_cookie"]
+        users[user_id]["user_agent"] = client_ctx["user_agent"]
+
+    _save_access_data(data)
+    return users[user_id]
+
+
+def _compute_access_state(user_record):
+    started_at = _parse_iso_utc(user_record.get("trial_started_at"))
+    if started_at is None:
+        started_at = datetime.now(timezone.utc)
+
+    trial_days = int(user_record.get("trial_days", TRIAL_DAYS) or TRIAL_DAYS)
+    trial_end = started_at + timedelta(days=trial_days)
+    now = datetime.now(timezone.utc)
+
+    trial_active = now <= trial_end
+    donation_unlocked = bool(user_record.get("donation_unlocked", False))
+    full_access = trial_active or donation_unlocked
+
+    remaining = trial_end - now
+    days_left = max(0, remaining.days + (1 if remaining.seconds > 0 else 0))
+
+    return {
+        "trial_active": trial_active,
+        "donation_unlocked": donation_unlocked,
+        "full_access": full_access,
+        "days_left": days_left,
+        "trial_end": trial_end,
+    }
+
+
+def _mark_current_user_donated(user_id):
+    data = _load_access_data()
+    users = data.setdefault("users", {})
+    user = users.get(user_id)
+    if not user:
+        return False
+    user["donation_unlocked"] = True
+    user["donation_unlocked_at"] = _utcnow_iso()
+    _save_access_data(data)
+    return True
 
 def extract_number(text):
     """
@@ -913,7 +1102,12 @@ def _extract_wav_bytes(mic_output):
 
 
 def _write_wav_bytes_to_tempfile(wav_bytes, prefix="recording_"):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav", prefix=prefix)
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".wav",
+        prefix=prefix,
+        dir=_ensure_app_temp_dir(),
+    )
     tmp.write(wav_bytes)
     tmp.flush()
     tmp.close()
@@ -967,9 +1161,54 @@ window.MathJax = {
 # Sidebar for configuration
 with st.sidebar:
     st.header("Configuration")
+    st.caption("API keys entered here are stored only for this browser session.")
     
     selected_model = st.selectbox("Select AI Model", list(ALL_MODEL_OPTIONS.keys()), index=0, key="model_selector")
     st.session_state.model_name = ALL_MODEL_OPTIONS[selected_model]
+
+    if selected_model in MODEL_OPTIONS:
+        st.caption("Selected model provider: Anthropic")
+    elif selected_model in GROK_MODELS:
+        st.caption("Selected model provider: xAI (Grok)")
+
+    col_clear_a, col_clear_b = st.columns(2)
+    with col_clear_a:
+        if st.button("Clear Anthropic Key"):
+            st.session_state.anthropic_api_key = ""
+            st.success("Anthropic API key cleared for this session.")
+            st.rerun()
+    with col_clear_b:
+        if st.button("Clear xAI Key"):
+            st.session_state.xai_api_key = ""
+            st.success("xAI API key cleared for this session.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Access & Trial")
+    client_ctx = _get_client_context()
+    user_id = _build_user_id(client_ctx)
+    user_record = _get_or_create_user_record(user_id, client_ctx)
+    access_state = _compute_access_state(user_record)
+
+    if access_state["trial_active"]:
+        st.info(f"Free trial active: {access_state['days_left']} day(s) remaining.")
+    elif access_state["donation_unlocked"]:
+        st.success("Full access unlocked by donation.")
+    else:
+        st.warning("Trial ended. Modes 2-6 are locked until donation.")
+
+    if not access_state["full_access"]:
+        if PAYPAL_DONATE_URL:
+            st.link_button("Donate with PayPal", PAYPAL_DONATE_URL)
+            st.caption("After donation, click 'I Donated' to unlock modes 2-6.")
+        else:
+            st.info("Set PAYPAL_DONATE_URL in .env to enable the donation button.")
+
+        if st.button("I Donated"):
+            if _mark_current_user_donated(user_id):
+                st.success("Thank you. Full access unlocked for this user.")
+                st.rerun()
+            st.error("Unable to update donation status. Please try again.")
     
     # Check if selected model is Anthropic and key is missing
     if selected_model in MODEL_OPTIONS:
@@ -1011,16 +1250,19 @@ with st.sidebar:
     
     if uploaded_pdf:
         # Save to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf', dir=_ensure_app_temp_dir()) as tmp_file:
             tmp_file.write(uploaded_pdf.getvalue())
             pdf_path = tmp_file.name
         
-        # Process the PDF
-        reader = PdfReader(pdf_path)
-        st.session_state.number_of_pages = len(reader.pages)
-        st.session_state.pages_text = [page.extract_text() for page in reader.pages]
-        st.session_state.book_name = uploaded_pdf.name
-        st.success(f"PDF loaded with {st.session_state.number_of_pages} pages")
+        try:
+            # Process the PDF
+            reader = PdfReader(pdf_path)
+            st.session_state.number_of_pages = len(reader.pages)
+            st.session_state.pages_text = [page.extract_text() for page in reader.pages]
+            st.session_state.book_name = uploaded_pdf.name
+            st.success(f"PDF loaded with {st.session_state.number_of_pages} pages")
+        finally:
+            _safe_remove_file(pdf_path)
     
     # Clear conversation
     if st.sidebar.button("Clear Conversation"):
@@ -1074,15 +1316,27 @@ else:
 
     if anthropic_client or xai_client:
         # Mode selection
+        free_modes = [
+            "Text Chat (Mode 0)",
+            "Audio Chat (Mode 1)",
+        ]
+        all_modes = [
+            "Text Chat (Mode 0)",
+            "Audio Chat (Mode 1)",
+            "Text-PDF Analysis (Mode 2)",
+            "Audio-PDF Analysis (Mode 3)",
+            "Audio Analysis (Mode 4)",
+            "Summarizing (Mode 5)",
+            "Formula_Summarizing (Mode 6)",
+        ]
+        available_modes = all_modes if access_state.get("full_access") else free_modes
+
+        if not access_state.get("full_access"):
+            st.warning("Trial ended. Only Mode 0 and Mode 1 are available until donation unlock.")
+
         mode = st.selectbox(
             "Select Mode", 
-            ["Text Chat (Mode 0)", 
-             "Audio Chat (Mode 1)", 
-             "Text-PDF Analysis (Mode 2)", 
-             "Audio-PDF Analysis (Mode 3)", 
-             "Audio Analysis (Mode 4)",
-             "Summarizing (Mode 5)",
-             "Formula_Summarizing (Mode 6)"],
+            available_modes,
             key="mode_selector"
         )
 
@@ -1344,14 +1598,13 @@ else:
             
             # Upload lecture audio
             uploaded_lecture = st.file_uploader("Upload lecture audio", type=["wav", "mp3"])
-            
-            if uploaded_lecture:
-                # Save to a temporary file
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
+            if uploaded_lecture and st.button("Analyze Lecture"):
+                lecture_suffix = os.path.splitext(uploaded_lecture.name or "")[1] or ".wav"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=lecture_suffix, dir=_ensure_app_temp_dir()) as tmp_file:
                     tmp_file.write(uploaded_lecture.getvalue())
                     lecture_path = tmp_file.name
-                
-                if st.button("Analyze Lecture"):
+
+                try:
                     # Process the lecture
                     with st.spinner("Transcribing lecture... This may take several minutes for long recordings."):
                         supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
@@ -1368,7 +1621,12 @@ else:
                     
                     # Save the analysis to HTML
                     html_file = save_to_html(system_response)
-                    st.success(f"Analysis saved to {html_file}")
+                    try:
+                        with open(html_file, "rb") as file:
+                            html_bytes = file.read()
+                    finally:
+                        _safe_remove_file(html_file)
+                    st.success("Analysis prepared for download.")
                     
                     # Display the analysis
                     st.subheader("Lecture Analysis")
@@ -1376,13 +1634,14 @@ else:
                     st.caption(_format_cost_line(st.session_state.get("last_response_cost")))
                     
                     # Provide download option
-                    with open(html_file, "rb") as file:
-                        st.download_button(
-                            label="Download HTML Analysis",
-                            data=file,
-                            file_name="lecture_analysis.html",
-                            mime="text/html"
-                        )
+                    st.download_button(
+                        label="Download HTML Analysis",
+                        data=html_bytes,
+                        file_name="lecture_analysis.html",
+                        mime="text/html"
+                    )
+                finally:
+                    _safe_remove_file(lecture_path)
 
         # Mode 5: Summarizing
         elif mode == "Summarizing (Mode 5)":
