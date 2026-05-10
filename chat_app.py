@@ -21,7 +21,7 @@ from streamlit_mic_recorder import mic_recorder
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 
-load_dotenv()  
+load_dotenv(override=True)  
 
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 grok_api_key = os.getenv("XAI_API_KEY") 
@@ -30,7 +30,7 @@ APP_TEMP_DIR = os.path.join(tempfile.gettempdir(), "academic_learning_assistant"
 TEMP_FILE_MAX_AGE_SECONDS = 60 * 60 * 6
 USER_ACCESS_FILE = os.path.join(os.path.dirname(__file__), "user_access.json")
 TRIAL_DAYS = 15
-PAYPAL_DONATE_URL = os.getenv("PAYPAL_DONATE_URL", "")
+PAYPAL_DONATE_URL = os.getenv("PAYPAL_DONATE_URL") or "https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=carabelea.andrei@gmail.com&item_name=Academic+Learning+Assistant+Support&currency_code=USD"
 
 #second change
 
@@ -250,6 +250,8 @@ if 'question_text_input' not in st.session_state:
     st.session_state.question_text_input = ""
 if 'pdf_question_editor' not in st.session_state:
     st.session_state.pdf_question_editor = ""
+if 'donation_clicked' not in st.session_state:
+    st.session_state.donation_clicked = False
 if 'last_response_cost' not in st.session_state:
     st.session_state.last_response_cost = None
 
@@ -322,6 +324,27 @@ def _get_header_value(headers, key_name):
     return ""
 
 
+def _get_remote_ip():
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        from streamlit.runtime import get_instance
+        ctx = get_script_run_ctx()
+        if ctx is None:
+            return None
+        runtime = get_instance()
+        session_info = runtime._session_mgr.get_active_session_info(ctx.session_id)
+        if session_info is not None:
+            # session_info.session.ws might contain the websocket request
+            # For Streamlit >= 1.12.0
+            ws = getattr(session_info, "ws", None)
+            if ws is not None:
+                req = getattr(ws, "request", None)
+                if req is not None:
+                    return req.remote_ip
+    except Exception:
+        pass
+    return None
+
 def _get_client_context():
     context = getattr(st, "context", None)
     headers = getattr(context, "headers", {}) if context else {}
@@ -329,7 +352,28 @@ def _get_client_context():
     forwarded_for = _get_header_value(headers, "x-forwarded-for")
     real_ip = _get_header_value(headers, "x-real-ip")
     remote_addr = _get_header_value(headers, "remote-addr")
-    ip = (forwarded_for.split(",")[0].strip() if forwarded_for else "") or real_ip or remote_addr or "unknown-ip"
+    ws_ip = _get_remote_ip()
+
+    candidates = []
+    if forwarded_for:
+        candidates.extend([x.strip() for x in forwarded_for.split(",")])
+    if real_ip:
+        candidates.append(real_ip.strip())
+    if remote_addr:
+        candidates.append(remote_addr.strip())
+    if ws_ip:
+        candidates.append(ws_ip.strip())
+
+    ip = "unknown-ip"
+    # Filter out common local/server IPs. 
+    # If the app is behind a reverse proxy, ws_ip is often 127.0.0.1.
+    # We prefer a real public IP from headers. If none exist, we fall back to "unknown-ip"
+    # so the app uses the device/cookie fallback instead of merging everyone under 127.0.0.1.
+    loopbacks = {"127.0.0.1", "::1", "localhost", "0.0.0.0"}
+    for c in candidates:
+        if c and c not in loopbacks:
+            ip = c
+            break
 
     user_agent = _get_header_value(headers, "user-agent") or "unknown-agent"
     device_type = _detect_device_type(user_agent)
@@ -349,7 +393,13 @@ def _get_client_context():
 
 
 def _build_user_id(client_ctx):
-    raw = f"{client_ctx['ip']}|{client_ctx['device_type']}|{client_ctx['browser_cookie']}"
+    ip = client_ctx.get("ip", "")
+    # If a real IP was found, use it exclusively to group the user.
+    # If IP retrieval failed, fallback to identifying by device and cookie.
+    if not ip or ip == "unknown-ip":
+        raw = f"fallback|{client_ctx.get('device_type', '')}|{client_ctx.get('browser_cookie', '')}"
+    else:
+        raw = f"{ip}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -1239,18 +1289,29 @@ with st.sidebar:
         else:
             st.warning("Trial ended. Modes 2-6 are locked until donation.")
 
-        if not access_state["full_access"]:
+        if not access_state["donation_unlocked"]:
             if PAYPAL_DONATE_URL:
-                st.link_button("Donate with PayPal", PAYPAL_DONATE_URL)
-                st.caption("After donation, click 'I Donated' to unlock modes 2-6.")
+                # Custom button that updates session state when clicked
+                if st.button("Donate with PayPal"):
+                    st.session_state.donation_clicked = True
+                    # Use a JavaScript hack to open the URL in a new tab because link_button return value isn't reliable for logic
+                    js = f"window.open('{PAYPAL_DONATE_URL}')"
+                    st.components.v1.html(f"<script>{js}</script>", height=0)
+                    st.rerun()
+                st.caption("You can choose any amount (e.g., $5, $7, or more).")
             else:
                 st.info("Set PAYPAL_DONATE_URL in .env to enable the donation button.")
 
-            if st.button("I Donated"):
-                if _mark_current_user_donated(user_id):
-                    st.success("Thank you. Full access unlocked for this user.")
-                    st.rerun()
-                st.error("Unable to update donation status. Please try again.")
+            # Only show "I Donated" if the user has clicked the donation link in this session
+            if st.session_state.get('donation_clicked', False):
+                if st.button("I Donated", help="Click this after completing your donation on PayPal"):
+                    if _mark_current_user_donated(user_id):
+                        st.success("Thank you! Full access unlocked.")
+                        st.rerun()
+                    st.error("Unable to update donation status. Please try again.")
+            else:
+                st.caption("Once you click the donation link above, the 'I Donated' button will appear to unlock your access.")
+
         
         # Check if selected model is Anthropic and key is missing
         if selected_model in MODEL_OPTIONS:
@@ -1306,6 +1367,36 @@ with st.sidebar:
                 st.success(f"PDF loaded with {st.session_state.number_of_pages} pages")
             finally:
                 _safe_remove_file(pdf_path)
+        
+        st.divider()
+        st.subheader("📖 User Guide")
+        guide_text = f"""
+# 🎓 Academic Learning Assistant – User Guide
+
+Welcome to the **Academic Learning Assistant**, a powerful AI-driven tool designed to help students and researchers analyze academic texts, presentations, and mathematical formulas using state-of-the-art models.
+
+---
+
+## ⚙️ 1. Configuration & Setup
+*   **AI Model**: Select your preferred provider (Anthropic or xAI) in the Settings tab.
+*   **PDF Upload**: Upload your document in this tab to enable analysis modes.
+
+## 🔓 2. Access & Trial
+*   **Trial**: New users get 15 days of full access.
+*   **Modes 0-1**: Always available for basic text and audio chat.
+*   **Modes 2-6**: Require an active trial or a donation to unlock. 
+*   **Donation**: Support the project with a $5.00 donation via the PayPal button in the **Settings** tab.
+
+## 🛠️ 3. Operating Modes
+*   **Mode 0 & 1**: Text and Audio chat for general academic teaching.
+*   **Mode 2 & 3**: Text or Audio based questioning of your uploaded PDF. Page numbers are entered manually.
+*   **Mode 4 (Presentation Analysis)**: Upload any audio (WAV/MP3) to get a structured scientific analysis and a downloadable HTML report.
+*   **Mode 5 (Summarizing)**: Compress specific page ranges by a selected percentage.
+*   **Mode 6 (Formula Extract)**: Automatically find and explain symbolic formulas using LaTeX.
+
+---
+        """
+        st.markdown(guide_text)
                 
     with tab_history:
         # Clear conversation
@@ -1376,7 +1467,7 @@ else:
             "Audio Chat (Mode 1)",
             "Text-PDF Analysis (Mode 2)",
             "Audio-PDF Analysis (Mode 3)",
-            "Audio Analysis (Mode 4)",
+            "Presentation Audio Analysis (Mode 4)",
             "Summarizing (Mode 5)",
             "Formula_Summarizing (Mode 6)",
         ]
@@ -1579,50 +1670,14 @@ else:
                 if 'question_text' in st.session_state and st.session_state.get("question_text_confirmed", False):
                     st.subheader("Step 2: Specify the page number")
                     
-                    if 'page_number' not in st.session_state:
-                        st.write("Say: the information is on page ...")
-
-                        mic_p = mic_recorder(
-                            start_prompt="Start Recording Page Number",
-                            stop_prompt="Stop Recording Page Number",
-                            key="pdf_page_mic",
-                        )
-                        wav_bytes_p = _extract_wav_bytes(mic_p)
-                        if wav_bytes_p:
-                            p_hash = hashlib.md5(wav_bytes_p).hexdigest()
-                            if st.session_state.get("pdf_page_last_hash") != p_hash:
-                                st.session_state.pdf_page_last_hash = p_hash
-
-                                wav_path = _write_wav_bytes_to_tempfile(wav_bytes_p, prefix="pdf_page_")
-                                try:
-                                    supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
-                                    whisper_model_type = supported_models[0]
-
-                                    result = transcribe_audio(wav_path, whisper_model_type, "en", use_cache=False)
-                                    page_text = result["text"]
-
-                                    extracted_page = extract_number(page_text)
-                                    if extracted_page and 1 <= extracted_page <= st.session_state.number_of_pages:
-                                        st.session_state.page_number = extracted_page
-                                        st.rerun()
-                                    else:
-                                        st.error(f"Could not extract a valid page number from '{page_text}'")
-                                finally:
-                                    try:
-                                        os.remove(wav_path)
-                                    except Exception:
-                                        pass
-                         
-                        # Alternative: manual page input
-                        manual_page = st.number_input("Or enter page manually:", min_value=1, max_value=st.session_state.number_of_pages)
-                        if st.button("Use This Page"):
-                            st.session_state.page_number = manual_page
-                            st.rerun()
-                    else:
+                    page_number = st.number_input("Enter page number:", min_value=1, max_value=st.session_state.number_of_pages, value=st.session_state.get('page_number', 1))
+                    if st.button("Confirm Page"):
+                        st.session_state.page_number = page_number
+                        st.rerun()
+                    
+                    if 'page_number' in st.session_state:
                         st.write(f"**Selected page:** {st.session_state.page_number}")
-                        if st.button("Change Page"):
-                            del st.session_state.page_number
-                            st.rerun()
+
                 
                 # Step 3: Show results
                 if 'question_text' in st.session_state and st.session_state.get("question_text_confirmed", False) and 'page_number' in st.session_state:
@@ -1649,31 +1704,31 @@ else:
                             del st.session_state.page_number
                         st.rerun()
 
-        # Mode 4: Audio Analysis
-        elif mode == "Audio Analysis (Mode 4)":
-            st.header("Audio Lecture Analysis")
+        # Mode 4: Presentation Audio Analysis
+        elif mode == "Presentation Audio Analysis (Mode 4)":
+            st.header("Presentation Audio Analysis")
             
-            # Upload lecture audio
-            uploaded_lecture = st.file_uploader("Upload lecture audio", type=["wav", "mp3"])
-            if uploaded_lecture and st.button("Analyze Lecture"):
-                lecture_suffix = os.path.splitext(uploaded_lecture.name or "")[1] or ".wav"
-                with tempfile.NamedTemporaryFile(delete=False, suffix=lecture_suffix, dir=_ensure_app_temp_dir()) as tmp_file:
-                    tmp_file.write(uploaded_lecture.getvalue())
-                    lecture_path = tmp_file.name
+            # Upload presentation audio
+            uploaded_audio = st.file_uploader("Upload presentation audio", type=["wav", "mp3"])
+            if uploaded_audio and st.button("Analyze Presentation"):
+                audio_suffix = os.path.splitext(uploaded_audio.name or "")[1] or ".wav"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=audio_suffix, dir=_ensure_app_temp_dir()) as tmp_file:
+                    tmp_file.write(uploaded_audio.getvalue())
+                    audio_path = tmp_file.name
 
                 try:
-                    # Process the lecture
-                    with st.spinner("Transcribing lecture... This may take several minutes for long recordings."):
+                    # Process the audio
+                    with st.spinner("Transcribing audio... This may take several minutes for long recordings."):
                         supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
                         whisper_model_type = supported_models[0]
                         
-                        result = transcribe_audio(lecture_path, whisper_model_type, "en", use_cache=True)
-                        lecture_text = result["text"]
+                        result = transcribe_audio(audio_path, whisper_model_type, "en", use_cache=True)
+                        transcription_text = result["text"]
                     
                     st.success("Transcription complete!")
                     
-                    with st.spinner("AI is analyzing the lecture content..."):
-                        lp = get_long_prompt(lecture_text)
+                    with st.spinner("AI is analyzing the content..."):
+                        lp = get_long_prompt(transcription_text)
                         system_response = get_system_response(anthropic_client, xai_client, lp)
                     
                     # Save the analysis to HTML
@@ -1686,7 +1741,7 @@ else:
                     st.success("Analysis prepared for download.")
                     
                     # Display the analysis
-                    st.subheader("Lecture Analysis")
+                    st.subheader("Presentation Analysis")
                     st.markdown(_normalize_math_delimiters(system_response))
                     st.caption(_format_cost_line(st.session_state.get("last_response_cost")))
                     
@@ -1694,11 +1749,11 @@ else:
                     st.download_button(
                         label="Download HTML Analysis",
                         data=html_bytes,
-                        file_name="lecture_analysis.html",
+                        file_name="presentation_analysis.html",
                         mime="text/html"
                     )
                 finally:
-                    _safe_remove_file(lecture_path)
+                    _safe_remove_file(audio_path)
 
         # Mode 5: Summarizing
         elif mode == "Summarizing (Mode 5)":
