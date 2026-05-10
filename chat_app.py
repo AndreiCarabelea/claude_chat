@@ -31,21 +31,150 @@ grok_api_key = os.getenv("XAI_API_KEY")
 # Define model options
 MODEL_OPTIONS = {
     "Claude Haiku 4.5": "claude-haiku-4-5-20251001",
-    "Claude Sonnet 4.5": "claude-sonnet-4-5-20250929", 
-    "Claude Opus 4.5": "claude-opus-4-5-20251101"
+    "Claude Sonnet 4.6": "claude-sonnet-4-6",
+    "Claude Opus 4.6": "claude-opus-4-6"
 }
 
 GROK_MODELS = {
-    "Grok 3 Mini": "grok-3-mini",
+    "Grok 4.3": "grok-4.3",
     "Grok 4.1 Fast Reason": "grok-4-1-fast-reasoning",
     "Grok 4.1 Fast Non-Reason": "grok-4-1-fast-non-reasoning"
 }
 
 # Combine model options for easy reference
 ALL_MODEL_OPTIONS = {**MODEL_OPTIONS, **GROK_MODELS}
+
+MODEL_PRICING_USD_PER_MILLION = {
+    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
+    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
+    "claude-opus-4-6": {"input": 15.00, "output": 75.00},
+    "grok-4.3": {"input": 2.00, "output": 8.00},
+    "grok-4-1-fast-reasoning": {"input": 5.00, "output": 20.00},
+    "grok-4-1-fast-non-reasoning": {"input": 1.50, "output": 6.00},
+}
+
+
+def _extract_usage_from_response(response):
+    input_tokens = 0
+    output_tokens = 0
+
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        return input_tokens, output_tokens
+
+    usage_metadata = getattr(response, "usage_metadata", None)
+    if isinstance(usage_metadata, dict):
+        input_tokens = int(usage_metadata.get("input_tokens", 0) or 0)
+        output_tokens = int(usage_metadata.get("output_tokens", 0) or 0)
+        if input_tokens or output_tokens:
+            return input_tokens, output_tokens
+
+    response_metadata = getattr(response, "response_metadata", None)
+    if isinstance(response_metadata, dict):
+        token_usage = response_metadata.get("token_usage", {}) or {}
+        input_tokens = int(
+            token_usage.get("prompt_tokens", token_usage.get("input_tokens", 0)) or 0
+        )
+        output_tokens = int(
+            token_usage.get(
+                "completion_tokens",
+                token_usage.get("output_tokens", token_usage.get("reasoning_tokens", 0)),
+            )
+            or 0
+        )
+
+    return input_tokens, output_tokens
+
+
+def _build_cost_info(model_name, input_tokens, output_tokens):
+    pricing = MODEL_PRICING_USD_PER_MILLION.get(model_name)
+    info = {
+        "model": model_name,
+        "input_tokens": int(input_tokens or 0),
+        "output_tokens": int(output_tokens or 0),
+        "input_price_per_million": None,
+        "output_price_per_million": None,
+        "input_cost": None,
+        "output_cost": None,
+        "total_cost": None,
+    }
+
+    if not pricing:
+        return info
+
+    input_price = float(pricing["input"])
+    output_price = float(pricing["output"])
+    input_cost = (info["input_tokens"] / 1_000_000) * input_price
+    output_cost = (info["output_tokens"] / 1_000_000) * output_price
+
+    info["input_price_per_million"] = input_price
+    info["output_price_per_million"] = output_price
+    info["input_cost"] = input_cost
+    info["output_cost"] = output_cost
+    info["total_cost"] = input_cost + output_cost
+    return info
+
+
+def _cost_info_from_response(response):
+    model_name = st.session_state.model_name
+    input_tokens, output_tokens = _extract_usage_from_response(response)
+    return _build_cost_info(model_name, input_tokens, output_tokens)
+
+
+def _merge_cost_info(total_info, new_info):
+    if not new_info:
+        return total_info
+    if not total_info:
+        return dict(new_info)
+
+    merged = dict(total_info)
+    merged["input_tokens"] = int(merged.get("input_tokens", 0)) + int(new_info.get("input_tokens", 0))
+    merged["output_tokens"] = int(merged.get("output_tokens", 0)) + int(new_info.get("output_tokens", 0))
+
+    input_cost_a = merged.get("input_cost")
+    input_cost_b = new_info.get("input_cost")
+    output_cost_a = merged.get("output_cost")
+    output_cost_b = new_info.get("output_cost")
+
+    merged["input_cost"] = (
+        (input_cost_a or 0.0) + (input_cost_b or 0.0)
+        if (input_cost_a is not None or input_cost_b is not None)
+        else None
+    )
+    merged["output_cost"] = (
+        (output_cost_a or 0.0) + (output_cost_b or 0.0)
+        if (output_cost_a is not None or output_cost_b is not None)
+        else None
+    )
+    if merged["input_cost"] is not None or merged["output_cost"] is not None:
+        merged["total_cost"] = (merged["input_cost"] or 0.0) + (merged["output_cost"] or 0.0)
+    else:
+        merged["total_cost"] = None
+
+    return merged
+
+
+def _format_cost_line(cost_info):
+    if not cost_info:
+        return "Cost: unavailable"
+
+    model = cost_info.get("model", "unknown")
+    input_tokens = int(cost_info.get("input_tokens", 0) or 0)
+    output_tokens = int(cost_info.get("output_tokens", 0) or 0)
+    total_cost = cost_info.get("total_cost")
+
+    if total_cost is None:
+        return f"Cost ({model}): usage {input_tokens} in / {output_tokens} out tokens; pricing unavailable"
+
+    return (
+        f"Cost ({model}): ${total_cost:.6f} "
+        f"({input_tokens} input + {output_tokens} output tokens)"
+    )
 # Initialize MODEL_NAME in session state if not already present
 if 'model_name' not in st.session_state:
-    st.session_state.model_name = MODEL_OPTIONS["Claude Sonnet 4.5"]  # Default model
+    st.session_state.model_name = MODEL_OPTIONS["Claude Sonnet 4.6"]  # Default model
 
 # Initialize session state variables
 if 'anthropic_api_key' not in st.session_state:
@@ -68,6 +197,18 @@ if 'audio_chat_wav_bytes' not in st.session_state:
     st.session_state.audio_chat_wav_bytes = None
 if 'audio_chat_last_hash' not in st.session_state:
     st.session_state.audio_chat_last_hash = None
+if 'audio_chat_transcription_input' not in st.session_state:
+    st.session_state.audio_chat_transcription_input = ""
+if 'audio_chat_transcription_editor' not in st.session_state:
+    st.session_state.audio_chat_transcription_editor = ""
+if 'question_text_confirmed' not in st.session_state:
+    st.session_state.question_text_confirmed = False
+if 'question_text_input' not in st.session_state:
+    st.session_state.question_text_input = ""
+if 'pdf_question_editor' not in st.session_state:
+    st.session_state.pdf_question_editor = ""
+if 'last_response_cost' not in st.session_state:
+    st.session_state.last_response_cost = None
 
 # Setup Anthropic client will be handled after we confirm the API key is set.
 
@@ -92,6 +233,124 @@ def extract_number(text):
         # Return None if no integer is found
         return None
     
+
+def _normalize_math_delimiters(text):
+    """
+    Wrap bare LaTeX expressions in $ or $$ delimiters for MathJax rendering.
+    
+    Handles:
+    1. The '**Formula:** <math> — <explanation>' pattern (Mode 6)
+    2. Inline LaTeX commands in general text
+    3. Avoids double-wrapping already-delimited expressions
+    """
+    if not text:
+        return text
+
+    # Already contains math delimiters — skip to avoid double-wrapping
+    if "$" in text:
+        return text
+
+    # ------------------------------------------------------------------
+    # LaTeX command patterns — anything that indicates a math expression
+    # ------------------------------------------------------------------
+    LATEX_COMMAND = re.compile(
+        r"\\(?:"
+        r"sum|int|prod|frac|sqrt|infty|cdot|times|div|pm|mp|"
+        r"alpha|beta|gamma|delta|epsilon|zeta|eta|theta|iota|kappa|"
+        r"lambda|mu|nu|xi|pi|rho|sigma|tau|upsilon|phi|chi|psi|omega|"
+        r"partial|nabla|rightarrow|leftarrow|Rightarrow|Leftarrow|"
+        r"left|right|langle|rangle|lim|to|text|begin|end|"
+        r"hat|bar|tilde|vec|dot|widehat|widetilde|"
+        r"mathbb|mathcal|mathbf|mathit|mathrm|mathsf|mathtt|"
+        r"cap|cup|subset|supset|in|notin|forall|exists|"
+        r"sim|approx|equiv|propto|leq|geq|neq|"
+        r"cdotp|colon|circ|bullet|oplus|otimes|odot|"
+        r"angle|triangle|square|diamond|"
+        r"exp|ln|log|sin|cos|tan|cot|sec|csc|"
+        r"arcsin|arccos|arctan|sinh|cosh|tanh|"
+        r"max|min|det|gcd|hom|ker|Pr|sup|inf|"
+        r"arg|deg|dim|lg|liminf|limsup|"
+        r"binom|bmod|pmod|"
+        r"overline|underline|overrightarrow|overleftarrow|"
+        r"breve|check|"
+        r"Bigg?|bigg?"
+        r")\b"
+    )
+
+    # ------------------------------------------------------------------
+    # Step 1 — Handle the structured "Formula:" pattern from Mode 6
+    #   Looks like:  **Formula:** <math> — <explanation>
+    #   or:           - **Formula:** <math> — <explanation>
+    # ------------------------------------------------------------------
+    def _wrap_formula_block(m):
+        prefix = m.group(1)      # e.g. "**Formula:** " or "- **Formula:** "
+        formula = m.group(2).strip()
+        sep = m.group(3)         # " — " or " – " or " - "
+        explanation = m.group(4)
+
+        if LATEX_COMMAND.search(formula):
+            # Standalone formula → display math
+            return f"{prefix}$${formula}$${sep}{explanation}"
+        return m.group(0)
+
+    text = re.sub(
+        r"(\*{0,2}Formula:\*{0,2}\s*)(.+?)(\s*[—–\-]\s*)(.+)",
+        _wrap_formula_block,
+        text,
+    )
+
+    # ------------------------------------------------------------------
+    # Step 2 — General inline LaTeX in text
+    #   Wrap lines that contain LaTeX commands but no $ delimiters
+    # ------------------------------------------------------------------
+    lines = text.split("\n")
+    result = []
+
+    for line in lines:
+        if not LATEX_COMMAND.search(line):
+            result.append(line)
+            continue
+
+        stripped = line.strip()
+
+        # Heuristic: count math-syntax characters vs total length
+        # High ratio → the line is predominantly math → wrap in $$
+        math_chars = len(
+            re.findall(r"[{}()\[\]\^\_=+\-*/\\]", stripped)
+        )
+        ratio = math_chars / max(1, len(stripped))
+
+        # Bullet lines:  "- text"  or  "* text"
+        bullet_match = re.match(r"^(\s*)([-*]\s+)(.*)", line)
+        if bullet_match:
+            indent = bullet_match.group(1)
+            bullet = bullet_match.group(2)
+            rest = bullet_match.group(3).strip()
+            if ratio > 0.12:
+                result.append(f"{indent}{bullet}$${rest}$$")
+            else:
+                result.append(line)
+        elif ratio > 0.12:
+            # Standalone math line (no surrounding prose)
+            result.append(f"$${stripped}$$")
+        else:
+            # Inline math embedded in prose — wrap the LaTeX
+            # sub-sequences individually
+            def _wrap_inline(m):
+                expr = m.group(0)
+                if "$" not in expr:
+                    return f"${expr}$"
+                return expr
+
+            line = re.sub(
+                r"\\[a-zA-Z]+(?:\{[^}]*\})*(?:\^\{[^}]*\})*(?:_\{[^}]*\})*",
+                _wrap_inline,
+                line,
+            )
+            result.append(line)
+
+    return "\n".join(result)
+
 
 def getLanguage(phrase):
     
@@ -143,28 +402,34 @@ def get_completion_pdf(anthropic_client, xai_client, simple_prompt, page_number,
     # Determine which client to use
     if st.session_state.model_name in MODEL_OPTIONS.values():
         if not anthropic_client:
-            return "Anthropic client not initialized. Please check your API key."
+            return {"text": "Anthropic client not initialized. Please check your API key.", "cost_info": None}
         response = anthropic_client.messages.create(
             model=st.session_state.model_name,
             max_tokens=2048,
             temperature=0.75,
-            system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts.",
+            system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical formulas, use LaTeX with $...$ for inline math and $...$ for display math.",
             messages=st.session_state.message_history
         )
-        return response.content[0].text
+        return {
+            "text": response.content[0].text,
+            "cost_info": _cost_info_from_response(response),
+        }
     elif st.session_state.model_name in GROK_MODELS.values():
         if not xai_client:
-            return "xAI client not initialized. Please check your API key."
+            return {"text": "xAI client not initialized. Please check your API key.", "cost_info": None}
         # For Grok, the prompt needs to be wrapped for Langchain
         from langchain_core.messages import HumanMessage, SystemMessage
         messages = [
-            SystemMessage(content="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts."),
+            SystemMessage(content="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical formulas, use LaTeX with $...$ for inline math and $...$ for display math."),
             HumanMessage(content=prompt)
         ]
         response = xai_client.invoke(messages)
-        return response.content
+        return {
+            "text": response.content,
+            "cost_info": _cost_info_from_response(response),
+        }
     else:
-        return "Selected model not supported."
+        return {"text": "Selected model not supported.", "cost_info": None}
 
 def find_section_and_respond(anthropic_client, xai_client, simple_prompt, page_number, chunk_width):
     """Incrementally increase chunk width to find relevant content"""
@@ -174,6 +439,7 @@ def find_section_and_respond(anthropic_client, xai_client, simple_prompt, page_n
     
     progress_bar = st.progress(0)
     status_text = st.empty()
+    total_cost_info = None
     
     while chunk_width <= max_width and attempts < max_attempts:
         progress = attempts / max_attempts
@@ -183,11 +449,20 @@ def find_section_and_respond(anthropic_client, xai_client, simple_prompt, page_n
         time.sleep(1)  # Brief delay for UI update
         delta = random.uniform(-1, 1) * 0.1 * page_number
         
-        x_response = get_completion_pdf(anthropic_client, xai_client, simple_prompt, page_number + delta, chunk_width)
+        completion_result = get_completion_pdf(
+            anthropic_client,
+            xai_client,
+            simple_prompt,
+            page_number + delta,
+            chunk_width,
+        )
+        x_response = completion_result.get("text", "")
+        total_cost_info = _merge_cost_info(total_cost_info, completion_result.get("cost_info"))
         
         if "None" not in x_response and len(x_response) > 300:
             st.success(f"Found relevant content with width: {chunk_width}")
             st.session_state.message_history.append({"role": 'assistant', "content": x_response})
+            st.session_state.last_response_cost = total_cost_info
             progress_bar.progress(1.0)
             return x_response
         
@@ -196,6 +471,7 @@ def find_section_and_respond(anthropic_client, xai_client, simple_prompt, page_n
         attempts += 1
     
     progress_bar.progress(1.0)
+    st.session_state.last_response_cost = total_cost_info
     # If we get here, we couldn't find a good response
     return "Could not find relevant information in the specified section of the document."
 
@@ -213,20 +489,22 @@ def get_system_response(anthropic_client, xai_client, simple_prompt):
                 model=st.session_state.model_name,
                 max_tokens=2048,
                 temperature=0.75,
-                system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts.",
+                system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical formulas, use LaTeX with $...$ for inline math and $...$ for display math.",
                 messages=st.session_state.message_history
             )
             result = response.content[0].text
+            st.session_state.last_response_cost = _cost_info_from_response(response)
         elif st.session_state.model_name in GROK_MODELS.values():
             if not xai_client:
                 return "xAI client not initialized. Please check your API key."
             from langchain_core.messages import HumanMessage, SystemMessage
             messages = [
-                SystemMessage(content="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts."),
+                SystemMessage(content="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical formulas, use LaTeX with $...$ for inline math and $...$ for display math."),
                 HumanMessage(content=simple_prompt)
             ]
             response = xai_client.invoke(messages)
             result = response.content
+            st.session_state.last_response_cost = _cost_info_from_response(response)
         else:
             return "Selected model not supported."
         
@@ -287,12 +565,13 @@ def get_pdf_summary(anthropic_client, xai_client, start_page, end_page, percenta
     
     st.session_state.message_history.append({"role": 'user', "content": f"Summarize pages {start_page}-{end_page} ({percentage}%) - Dynamic Chunk Size: {CHUNK_SIZE}"})
     
-    system_msg = "You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical content, focus on general formulas and symbolic representations rather than specific numerical calculations."
+    system_msg = "You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical content, focus on general formulas and symbolic representations rather than specific numerical calculations. Use LaTeX with $...$ for inline math and $$...$$ for display formulas."
     full_summary = []
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     total_chunks = len(page_chunks)
+    total_cost_info = None
 
     try:
         for idx, (chunk_start, chunk_end) in enumerate(page_chunks):
@@ -304,7 +583,8 @@ def get_pdf_summary(anthropic_client, xai_client, start_page, end_page, percenta
             prompt = (f"Please provide a detailed summary of the following academic text from pages {chunk_start} to {chunk_end}. "
                       f"The summary should be approximately {percentage}% of the original length. "
                       "Focus on keeping the main concepts and skipping irrelevant factual data. "
-                      "When encountering formulas or mathematical derivations, ignore specific numerical calculations and instead represent the general formula or symbolic representation.\n\n"
+                      "When encountering formulas or mathematical derivations, ignore specific numerical calculations and instead represent the general formula or symbolic representation. "
+                      "Use LaTeX with $...$ for inline math and $$...$$ for display formulas.\n\n"
                       f"<text>{text_chunk}</text>")
             
             # Determine which client to use
@@ -319,6 +599,7 @@ def get_pdf_summary(anthropic_client, xai_client, start_page, end_page, percenta
                     messages=[{"role": "user", "content": prompt}]
                 )
                 chunk_result = response.content[0].text
+                total_cost_info = _merge_cost_info(total_cost_info, _cost_info_from_response(response))
             elif st.session_state.model_name in GROK_MODELS.values():
                 if not xai_client:
                     return "xAI client not initialized. Please check your API key."
@@ -329,6 +610,7 @@ def get_pdf_summary(anthropic_client, xai_client, start_page, end_page, percenta
                 ]
                 response = xai_client.invoke(messages)
                 chunk_result = response.content
+                total_cost_info = _merge_cost_info(total_cost_info, _cost_info_from_response(response))
             else:
                 return "Selected model not supported."
             
@@ -340,6 +622,7 @@ def get_pdf_summary(anthropic_client, xai_client, start_page, end_page, percenta
         
         final_result = "\n\n".join(full_summary)
         st.session_state.message_history.append({"role": 'assistant', "content": final_result})
+        st.session_state.last_response_cost = total_cost_info
         return final_result
 
     except Exception as e:
@@ -450,6 +733,7 @@ def get_pdf_formula_summary(anthropic_client, xai_client, start_page, end_page):
         "Ignore purely numerical computations (e.g., 12/3=4, plugging numbers into a formula, arithmetic steps). "
         "Include ONLY symbolic formulas that contain variables/parameters (letters or Greek symbols). "
         "For each formula, provide a very short explanation (1 sentence). "
+        "Always wrap formulas in LaTeX math delimiters: $...$ for inline and $$...$$ for display. "
         "Do not write a general summary. Do not include a compression ratio. "
         "If the text contains no explicit formulas/equations, respond with: 'No formulas found.'"
     )
@@ -458,6 +742,7 @@ def get_pdf_formula_summary(anthropic_client, xai_client, start_page, end_page):
     status_text = st.empty()
     total_chunks = len(page_chunks)
     results = []
+    total_cost_info = None
 
     try:
         for idx, (chunk_start, chunk_end) in enumerate(page_chunks):
@@ -470,8 +755,9 @@ def get_pdf_formula_summary(anthropic_client, xai_client, start_page, end_page):
             prompt = (
                 f"From pages {chunk_start} to {chunk_end}, extract ONLY formulas/equations that appear in the text. "
                 "EXCLUDE purely numerical calculations; INCLUDE ONLY symbolic formulas with variables/parameters. "
-                "Return a bullet list. Each bullet must be: - **Formula:** <formula> — <1 short sentence explanation>. "
-                "If the formula is not cleanly readable, reconstruct it as best as possible, using standard mathematical notation. "
+                "Return a bullet list. Each bullet must be: - **Formula:** $<formula>$ — <1 short sentence explanation>. "
+                "Always use LaTeX math delimiters: $...$ for formulas. "
+                "If the formula is not cleanly readable, reconstruct it as best as possible, using standard LaTeX mathematical notation. "
                 "Do not include any other commentary, preface, or summary.\n\n"
                 f"<text>{text_chunk}</text>"
             )
@@ -487,6 +773,7 @@ def get_pdf_formula_summary(anthropic_client, xai_client, start_page, end_page):
                     messages=[{"role": "user", "content": prompt}],
                 )
                 chunk_result = response.content[0].text
+                total_cost_info = _merge_cost_info(total_cost_info, _cost_info_from_response(response))
             elif st.session_state.model_name in GROK_MODELS.values():
                 if not xai_client:
                     return "xAI client not initialized. Please check your API key."
@@ -495,6 +782,7 @@ def get_pdf_formula_summary(anthropic_client, xai_client, start_page, end_page):
                 messages = [SystemMessage(content=system_msg), HumanMessage(content=prompt)]
                 response = xai_client.invoke(messages)
                 chunk_result = response.content
+                total_cost_info = _merge_cost_info(total_cost_info, _cost_info_from_response(response))
             else:
                 return "Selected model not supported."
 
@@ -532,6 +820,7 @@ def get_pdf_formula_summary(anthropic_client, xai_client, start_page, end_page):
         else:
             final_result = "\n\n".join(results).strip()
         st.session_state.message_history.append({"role": "assistant", "content": final_result})
+        st.session_state.last_response_cost = total_cost_info
         return final_result
 
     except Exception as e:
@@ -633,6 +922,47 @@ def _write_wav_bytes_to_tempfile(wav_bytes, prefix="recording_"):
 # Main Streamlit app
 st.title("Academic Learning Assistant")
 st.markdown("<h1 style='text-align: center;'></h1>", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Inject MathJax for LaTeX rendering (handles $...$ and $$...$$ delimiters)
+# ---------------------------------------------------------------------------
+st.markdown(
+    """
+<script>
+window.MathJax = {
+  tex: {
+    inlineMath: [['$', '$'], ['\\(', '\\)']],
+    displayMath: [['$$', '$$'], ['\\[', '\\]']],
+    processEscapes: true
+  }
+};
+</script>
+<script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js">
+</script>
+<script>
+(function() {
+  var interval = setInterval(function() {
+    if (window.MathJax && window.MathJax.typesetPromise) {
+      clearInterval(interval);
+      MathJax.typesetPromise();
+      var target = document.querySelector('[data-testid="stApp"]') || document.body;
+      var observer = new MutationObserver(function(mutations) {
+        var shouldTypeset = false;
+        for (var i = 0; i < mutations.length; i++) {
+          if (mutations[i].addedNodes.length) { shouldTypeset = true; break; }
+        }
+        if (shouldTypeset) {
+          MathJax.typesetPromise().catch(function(err) {  });
+        }
+      });
+      observer.observe(target, { childList: true, subtree: true });
+    }
+  }, 150);
+})();
+</script>
+""",
+    unsafe_allow_html=True,
+)
 
 # Sidebar for configuration
 with st.sidebar:
@@ -767,7 +1097,8 @@ else:
                     st.write(f"**You:** {user_input}")
                     with st.spinner("AI is thinking..."):
                         response = get_system_response(anthropic_client, xai_client, user_input)
-                    st.write(f"**AI:** {response}")
+                    st.markdown(f"**AI:**\n\n{_normalize_math_delimiters(response)}")
+                    st.caption(_format_cost_line(st.session_state.get("last_response_cost")))
 
         # Mode 1: Audio Chat
         elif mode == "Audio Chat (Mode 1)":
@@ -798,14 +1129,8 @@ else:
                             whisper_model_type = supported_models[0]
                             result = transcribe_audio(wav_path, whisper_model_type, "en", use_cache=False)
                             st.session_state.audio_chat_transcription = result["text"]
-
-                        with st.spinner("AI is thinking..."):
-                            response = get_system_response(
-                                anthropic_client,
-                                xai_client,
-                                st.session_state.audio_chat_transcription,
-                            )
-                            st.session_state.audio_chat_response = response
+                            st.session_state.audio_chat_transcription_input = result["text"]
+                            st.session_state.audio_chat_transcription_editor = result["text"]
                     finally:
                         try:
                             os.remove(wav_path)
@@ -818,9 +1143,38 @@ else:
             if st.session_state.audio_chat_wav_bytes:
                 st.audio(st.session_state.audio_chat_wav_bytes, format="audio/wav")
             if st.session_state.audio_chat_transcription:
-                st.write(f"**You said:** {st.session_state.audio_chat_transcription}")
+                edited_transcription = st.text_area(
+                    "Review and edit transcription before sending:",
+                    key="audio_chat_transcription_editor",
+                    height=110,
+                )
+                st.session_state.audio_chat_transcription_input = edited_transcription
+
+                if st.button("Send to AI", key="audio_chat_send"):
+                    if edited_transcription.strip():
+                        st.session_state.audio_chat_transcription = edited_transcription.strip()
+                        with st.spinner("AI is thinking..."):
+                            response = get_system_response(
+                                anthropic_client,
+                                xai_client,
+                                st.session_state.audio_chat_transcription,
+                            )
+                            st.session_state.audio_chat_response = response
+                        st.rerun()
+                    else:
+                        st.warning("Transcription is empty. Please edit it or record again.")
+
+                if st.button("Record Again", key="audio_chat_record_again"):
+                    st.session_state.audio_chat_transcription = None
+                    st.session_state.audio_chat_transcription_input = ""
+                    st.session_state.audio_chat_transcription_editor = ""
+                    st.session_state.audio_chat_response = None
+                    st.rerun()
+
+                st.write(f"**Final transcription sent:** {st.session_state.audio_chat_transcription}")
             if st.session_state.audio_chat_response:
-                st.write(f"**AI:** {st.session_state.audio_chat_response}")
+                st.markdown(f"**AI:**\n\n{_normalize_math_delimiters(st.session_state.audio_chat_response)}")
+                st.caption(_format_cost_line(st.session_state.get("last_response_cost")))
 
         # Mode 2: Text-PDF Analysis
         elif mode == "Text-PDF Analysis (Mode 2)":
@@ -840,9 +1194,8 @@ else:
                         with st.spinner("Analyzing document..."):
                             explanation = find_section_and_respond(anthropic_client, xai_client, simple_prompt, page_number, 2)
                         st.write("**Answer:**")
-                        st.write(explanation)
-
-        # Mode 3: Audio-PDF Analysis
+                        st.markdown(_normalize_math_delimiters(explanation))
+                        st.caption(_format_cost_line(st.session_state.get("last_response_cost")))
         elif mode == "Audio-PDF Analysis (Mode 3)":
             st.header("Audio-PDF Analysis")
             
@@ -872,6 +1225,9 @@ else:
                                 whisper_model_type = supported_models[0]
                                 result = transcribe_audio(wav_path, whisper_model_type, "en", use_cache=False)
                                 st.session_state.question_text = result["text"]
+                                st.session_state.question_text_input = result["text"]
+                                st.session_state.pdf_question_editor = result["text"]
+                                st.session_state.question_text_confirmed = False
                             finally:
                                 try:
                                     os.remove(wav_path)
@@ -881,13 +1237,35 @@ else:
                             st.rerun()
 
                 else:
+                    if not st.session_state.get("question_text_confirmed", False):
+                        edited_question = st.text_area(
+                            "Review and edit your transcribed question:",
+                            key="pdf_question_editor",
+                            height=110,
+                        )
+                        st.session_state.question_text_input = edited_question
+
+                        if st.button("Confirm Question", key="pdf_confirm_question"):
+                            if edited_question.strip():
+                                st.session_state.question_text = edited_question.strip()
+                                st.session_state.question_text_confirmed = True
+                                st.rerun()
+                            else:
+                                st.warning("Question is empty. Please edit it or record again.")
+
                     st.write(f"**Your question:** {st.session_state.question_text}")
-                    if st.button("Record Again"):
+                    if st.button("Record Again", key="pdf_question_record_again"):
                         del st.session_state.question_text
+                        st.session_state.question_text_input = ""
+                        st.session_state.pdf_question_editor = ""
+                        st.session_state.question_text_confirmed = False
+                        st.rerun()
+                    if st.session_state.get("question_text_confirmed", False) and st.button("Edit Question", key="pdf_question_edit"):
+                        st.session_state.question_text_confirmed = False
                         st.rerun()
                 
                 # Step 2: Get page number
-                if 'question_text' in st.session_state:
+                if 'question_text' in st.session_state and st.session_state.get("question_text_confirmed", False):
                     st.subheader("Step 2: Specify the page number")
                     
                     if 'page_number' not in st.session_state:
@@ -936,7 +1314,7 @@ else:
                             st.rerun()
                 
                 # Step 3: Show results
-                if 'question_text' in st.session_state and 'page_number' in st.session_state:
+                if 'question_text' in st.session_state and st.session_state.get("question_text_confirmed", False) and 'page_number' in st.session_state:
                     st.subheader("Step 3: Get Answer")
                     
                     st.write(f"**Question:** {st.session_state.question_text}")
@@ -947,11 +1325,15 @@ else:
                             explanation = find_section_and_respond(anthropic_client, xai_client, st.session_state.question_text, st.session_state.page_number, 2)
                         
                         st.write("**Answer:**")
-                        st.write(explanation)
+                        st.markdown(_normalize_math_delimiters(explanation))
+                        st.caption(_format_cost_line(st.session_state.get("last_response_cost")))
                     
                     if st.button("Start Over"):
                         if 'question_text' in st.session_state:
                             del st.session_state.question_text
+                        st.session_state.question_text_input = ""
+                        st.session_state.pdf_question_editor = ""
+                        st.session_state.question_text_confirmed = False
                         if 'page_number' in st.session_state:
                             del st.session_state.page_number
                         st.rerun()
@@ -990,7 +1372,8 @@ else:
                     
                     # Display the analysis
                     st.subheader("Lecture Analysis")
-                    st.write(system_response)
+                    st.markdown(_normalize_math_delimiters(system_response))
+                    st.caption(_format_cost_line(st.session_state.get("last_response_cost")))
                     
                     # Provide download option
                     with open(html_file, "rb") as file:
@@ -1022,9 +1405,11 @@ else:
                         ranges = parse_page_ranges(page_range, st.session_state.number_of_pages)
                         
                         combined_sections = []
+                        total_cost_info = None
                         with st.spinner("Generating summary..."):
                             for start_p, end_p in ranges:
                                 summary = get_pdf_summary(anthropic_client, xai_client, start_p, end_p, percentage)
+                                total_cost_info = _merge_cost_info(total_cost_info, st.session_state.get("last_response_cost"))
                                 
                                 if len(ranges) > 1:
                                     combined_sections.append(f"#### Pages {start_p}-{end_p}\n\n{summary}")
@@ -1032,8 +1417,10 @@ else:
                                     combined_sections.append(summary)
                         
                         final_summary = "\n\n".join(combined_sections).strip()
+                        st.session_state.last_response_cost = total_cost_info
                         st.subheader("Summary")
-                        st.markdown(final_summary)
+                        st.markdown(_normalize_math_delimiters(final_summary))
+                        st.caption(_format_cost_line(st.session_state.get("last_response_cost")))
                     except ValueError as e:
                         st.error(str(e) or "Please enter valid page ranges.")
 
@@ -1060,6 +1447,7 @@ else:
                         )
 
                         combined_sections = []
+                        total_cost_info = None
                         with st.spinner("Extracting formulas..."):
                             for start_p, end_p in ranges:
                                 formulas = get_pdf_formula_summary(
@@ -1068,6 +1456,7 @@ else:
                                     start_p,
                                     end_p,
                                 )
+                                total_cost_info = _merge_cost_info(total_cost_info, st.session_state.get("last_response_cost"))
 
                                 if (formulas or "").strip() == "No formulas found.":
                                     continue
@@ -1084,9 +1473,11 @@ else:
                             if not combined_sections
                             else "\n\n".join(combined_sections).strip()
                         )
+                        st.session_state.last_response_cost = total_cost_info
 
                         st.subheader("Formulas")
-                        st.markdown(final_formulas)
+                        st.markdown(_normalize_math_delimiters(final_formulas))
+                        st.caption(_format_cost_line(st.session_state.get("last_response_cost")))
                     except ValueError as e:
                         st.error(str(e) or "Please enter valid page ranges.")
 
