@@ -70,6 +70,11 @@ def _extract_usage_from_response(response):
     if usage is not None:
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
         output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        # OpenAI/xAI style usage fields
+        if not input_tokens:
+            input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        if not output_tokens:
+            output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
         return input_tokens, output_tokens
 
     usage_metadata = getattr(response, "usage_metadata", None)
@@ -129,6 +134,36 @@ def _cost_info_from_response(response):
     model_name = st.session_state.model_name
     input_tokens, output_tokens = _extract_usage_from_response(response)
     return _build_cost_info(model_name, input_tokens, output_tokens)
+
+
+def _invoke_xai_chat(xai_client, system_text, user_text, max_tokens=2048, temperature=0.75):
+    """Call xAI directly through OpenAI-compatible client to avoid LangChain RunInfo UUID issues."""
+    response = xai_client.client.create(
+        model=st.session_state.model_name,
+        messages=[
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ],
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+
+    # Diagnostic signal for runtime validation
+    response_id = getattr(response, "id", None)
+    print(
+        f"[GROK_DEBUG] model={st.session_state.model_name} "
+        f"response_id_type={type(response_id).__name__}"
+    )
+
+    text = ""
+    if getattr(response, "choices", None):
+        message = response.choices[0].message
+        text = getattr(message, "content", "") or ""
+
+    return {
+        "text": text,
+        "cost_info": _cost_info_from_response(response),
+    }
 
 
 def _merge_cost_info(total_info, new_info):
@@ -606,17 +641,13 @@ def get_completion_pdf(anthropic_client, xai_client, simple_prompt, page_number,
     elif st.session_state.model_name in GROK_MODELS.values():
         if not xai_client:
             return {"text": "xAI client not initialized. Please check your API key.", "cost_info": None}
-        # For Grok, the prompt needs to be wrapped for Langchain
-        from langchain_core.messages import HumanMessage, SystemMessage
-        messages = [
-            SystemMessage(content="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical formulas, use LaTeX with $...$ for inline math and $...$ for display math."),
-            HumanMessage(content=prompt)
-        ]
-        response = xai_client.invoke(messages)
-        return {
-            "text": response.content,
-            "cost_info": _cost_info_from_response(response),
-        }
+        return _invoke_xai_chat(
+            xai_client=xai_client,
+            system_text="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical formulas, use LaTeX with $...$ for inline math and $...$ for display math.",
+            user_text=prompt,
+            max_tokens=2048,
+            temperature=0.75,
+        )
     else:
         return {"text": "Selected model not supported.", "cost_info": None}
 
@@ -686,14 +717,15 @@ def get_system_response(anthropic_client, xai_client, simple_prompt):
         elif st.session_state.model_name in GROK_MODELS.values():
             if not xai_client:
                 return "xAI client not initialized. Please check your API key."
-            from langchain_core.messages import HumanMessage, SystemMessage
-            messages = [
-                SystemMessage(content="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical formulas, use LaTeX with $...$ for inline math and $...$ for display math."),
-                HumanMessage(content=simple_prompt)
-            ]
-            response = xai_client.invoke(messages)
-            result = response.content
-            st.session_state.last_response_cost = _cost_info_from_response(response)
+            xai_result = _invoke_xai_chat(
+                xai_client=xai_client,
+                system_text="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical formulas, use LaTeX with $...$ for inline math and $...$ for display math.",
+                user_text=simple_prompt,
+                max_tokens=2048,
+                temperature=0.75,
+            )
+            result = xai_result["text"]
+            st.session_state.last_response_cost = xai_result["cost_info"]
         else:
             return "Selected model not supported."
         
@@ -792,14 +824,15 @@ def get_pdf_summary(anthropic_client, xai_client, start_page, end_page, percenta
             elif st.session_state.model_name in GROK_MODELS.values():
                 if not xai_client:
                     return "xAI client not initialized. Please check your API key."
-                from langchain_core.messages import HumanMessage, SystemMessage
-                messages = [
-                    SystemMessage(content=system_msg),
-                    HumanMessage(content=prompt)
-                ]
-                response = xai_client.invoke(messages)
-                chunk_result = response.content
-                total_cost_info = _merge_cost_info(total_cost_info, _cost_info_from_response(response))
+                xai_result = _invoke_xai_chat(
+                    xai_client=xai_client,
+                    system_text=system_msg,
+                    user_text=prompt,
+                    max_tokens=4096,
+                    temperature=0.75,
+                )
+                chunk_result = xai_result["text"]
+                total_cost_info = _merge_cost_info(total_cost_info, xai_result["cost_info"])
             else:
                 return "Selected model not supported."
             
@@ -966,12 +999,15 @@ def get_pdf_formula_summary(anthropic_client, xai_client, start_page, end_page):
             elif st.session_state.model_name in GROK_MODELS.values():
                 if not xai_client:
                     return "xAI client not initialized. Please check your API key."
-                from langchain_core.messages import HumanMessage, SystemMessage
-
-                messages = [SystemMessage(content=system_msg), HumanMessage(content=prompt)]
-                response = xai_client.invoke(messages)
-                chunk_result = response.content
-                total_cost_info = _merge_cost_info(total_cost_info, _cost_info_from_response(response))
+                xai_result = _invoke_xai_chat(
+                    xai_client=xai_client,
+                    system_text=system_msg,
+                    user_text=prompt,
+                    max_tokens=1200,
+                    temperature=0.2,
+                )
+                chunk_result = xai_result["text"]
+                total_cost_info = _merge_cost_info(total_cost_info, xai_result["cost_info"])
             else:
                 return "Selected model not supported."
 
@@ -1160,114 +1196,129 @@ window.MathJax = {
 
 # Sidebar for configuration
 with st.sidebar:
-    st.header("Configuration")
-    st.caption("API keys entered here are stored only for this browser session.")
+    # ---------------------------------------------------------------------------
+    # Configuration Tabs
+    # ---------------------------------------------------------------------------
+    tab_settings, tab_pdf, tab_history = st.tabs(["⚙️ Settings", "📄 PDF", "📜 History"])
     
-    selected_model = st.selectbox("Select AI Model", list(ALL_MODEL_OPTIONS.keys()), index=0, key="model_selector")
-    st.session_state.model_name = ALL_MODEL_OPTIONS[selected_model]
-
-    if selected_model in MODEL_OPTIONS:
-        st.caption("Selected model provider: Anthropic")
-    elif selected_model in GROK_MODELS:
-        st.caption("Selected model provider: xAI (Grok)")
-
-    col_clear_a, col_clear_b = st.columns(2)
-    with col_clear_a:
-        if st.button("Clear Anthropic Key"):
-            st.session_state.anthropic_api_key = ""
-            st.success("Anthropic API key cleared for this session.")
-            st.rerun()
-    with col_clear_b:
-        if st.button("Clear xAI Key"):
-            st.session_state.xai_api_key = ""
-            st.success("xAI API key cleared for this session.")
-            st.rerun()
-
-    st.divider()
-    st.subheader("Access & Trial")
-    client_ctx = _get_client_context()
-    user_id = _build_user_id(client_ctx)
-    user_record = _get_or_create_user_record(user_id, client_ctx)
-    access_state = _compute_access_state(user_record)
-
-    if access_state["trial_active"]:
-        st.info(f"Free trial active: {access_state['days_left']} day(s) remaining.")
-    elif access_state["donation_unlocked"]:
-        st.success("Full access unlocked by donation.")
-    else:
-        st.warning("Trial ended. Modes 2-6 are locked until donation.")
-
-    if not access_state["full_access"]:
-        if PAYPAL_DONATE_URL:
-            st.link_button("Donate with PayPal", PAYPAL_DONATE_URL)
-            st.caption("After donation, click 'I Donated' to unlock modes 2-6.")
-        else:
-            st.info("Set PAYPAL_DONATE_URL in .env to enable the donation button.")
-
-        if st.button("I Donated"):
-            if _mark_current_user_donated(user_id):
-                st.success("Thank you. Full access unlocked for this user.")
-                st.rerun()
-            st.error("Unable to update donation status. Please try again.")
-    
-    # Check if selected model is Anthropic and key is missing
-    if selected_model in MODEL_OPTIONS:
-        if not st.session_state.get("anthropic_api_key"):
-            st.info("Anthropic API key required for selected model")
-            api_key_input = st.text_input(
-                "Enter your Anthropic API Key", 
-                type="password", 
-                key="api_key_input",
-                help="You can find your API key on your Anthropic dashboard."
-            )
-            if api_key_input:
-                st.session_state.anthropic_api_key = api_key_input
-                st.success("Anthropic API Key set for this session.")
-                st.rerun()
-        else:
-            st.success("Anthropic API key is set.")
-    
-    # Check if selected model is Grok and key is missing
-    if selected_model in GROK_MODELS:
-        if not st.session_state.get("xai_api_key"):
-            st.info("xAI API key required for selected model")
-            xai_key_input = st.text_input(
-                "Enter your xAI API Key", 
-                type="password", 
-                key="xai_api_key_input",
-                help="You can find your API key on your xAI dashboard (e.g., Grok)."
-            )
-            if xai_key_input:
-                st.session_state.xai_api_key = xai_key_input
-                st.success("xAI API Key set for this session.")
-                st.rerun()
-        else:
-            st.success("xAI API key is set.")
-    
-    # PDF Upload
-    st.subheader("PDF Upload")
-    uploaded_pdf = st.file_uploader("Upload a PDF", type="pdf")
-    
-    if uploaded_pdf:
-        # Save to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf', dir=_ensure_app_temp_dir()) as tmp_file:
-            tmp_file.write(uploaded_pdf.getvalue())
-            pdf_path = tmp_file.name
+    with tab_settings:
+        st.header("Configuration")
+        st.caption("API keys entered here are stored only for this browser session.")
         
-        try:
-            # Process the PDF
-            reader = PdfReader(pdf_path)
-            st.session_state.number_of_pages = len(reader.pages)
-            st.session_state.pages_text = [page.extract_text() for page in reader.pages]
-            st.session_state.book_name = uploaded_pdf.name
-            st.success(f"PDF loaded with {st.session_state.number_of_pages} pages")
-        finally:
-            _safe_remove_file(pdf_path)
-    
-    # Clear conversation
-    if st.sidebar.button("Clear Conversation"):
-        st.session_state.message_history = []
-        st.success("Conversation history cleared!")
+        selected_model = st.selectbox("Select AI Model", list(ALL_MODEL_OPTIONS.keys()), index=0, key="model_selector")
+        st.session_state.model_name = ALL_MODEL_OPTIONS[selected_model]
+
+        if selected_model in MODEL_OPTIONS:
+            st.caption("Selected model provider: Anthropic")
+        elif selected_model in GROK_MODELS:
+            st.caption("Selected model provider: xAI (Grok)")
+
+        col_clear_a, col_clear_b = st.columns(2)
+        with col_clear_a:
+            if st.button("Clear Anthropic Key"):
+                st.session_state.anthropic_api_key = ""
+                st.success("Anthropic API key cleared for this session.")
+                st.rerun()
+        with col_clear_b:
+            if st.button("Clear xAI Key"):
+                st.session_state.xai_api_key = ""
+                st.success("xAI API key cleared for this session.")
+                st.rerun()
+
+        st.divider()
+        st.subheader("Access & Trial")
+        client_ctx = _get_client_context()
+        user_id = _build_user_id(client_ctx)
+        user_record = _get_or_create_user_record(user_id, client_ctx)
+        access_state = _compute_access_state(user_record)
+
+        if access_state["trial_active"]:
+            st.info(f"Free trial active: {access_state['days_left']} day(s) remaining.")
+        elif access_state["donation_unlocked"]:
+            st.success("Full access unlocked by donation.")
+        else:
+            st.warning("Trial ended. Modes 2-6 are locked until donation.")
+
+        if not access_state["full_access"]:
+            if PAYPAL_DONATE_URL:
+                st.link_button("Donate with PayPal", PAYPAL_DONATE_URL)
+                st.caption("After donation, click 'I Donated' to unlock modes 2-6.")
+            else:
+                st.info("Set PAYPAL_DONATE_URL in .env to enable the donation button.")
+
+            if st.button("I Donated"):
+                if _mark_current_user_donated(user_id):
+                    st.success("Thank you. Full access unlocked for this user.")
+                    st.rerun()
+                st.error("Unable to update donation status. Please try again.")
+        
+        # Check if selected model is Anthropic and key is missing
+        if selected_model in MODEL_OPTIONS:
+            if not st.session_state.get("anthropic_api_key"):
+                st.info("Anthropic API key required for selected model")
+                api_key_input = st.text_input(
+                    "Enter your Anthropic API Key", 
+                    type="password", 
+                    key="api_key_input",
+                    help="You can find your API key on your Anthropic dashboard."
+                )
+                if api_key_input:
+                    st.session_state.anthropic_api_key = api_key_input
+                    st.success("Anthropic API Key set for this session.")
+                    st.rerun()
+            else:
+                st.success("Anthropic API key is set.")
+        
+        # Check if selected model is Grok and key is missing
+        if selected_model in GROK_MODELS:
+            if not st.session_state.get("xai_api_key"):
+                st.info("xAI API key required for selected model")
+                xai_key_input = st.text_input(
+                    "Enter your xAI API Key", 
+                    type="password", 
+                    key="xai_api_key_input",
+                    help="You can find your API key on your xAI dashboard (e.g., Grok)."
+                )
+                if xai_key_input:
+                    st.session_state.xai_api_key = xai_key_input
+                    st.success("xAI API Key set for this session.")
+                    st.rerun()
+            else:
+                st.success("xAI API key is set.")
+
+    with tab_pdf:
+        # PDF Upload
+        st.subheader("PDF Upload")
+        uploaded_pdf = st.file_uploader("Upload a PDF", type="pdf")
+        
+        if uploaded_pdf:
+            # Save to a temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf', dir=_ensure_app_temp_dir()) as tmp_file:
+                tmp_file.write(uploaded_pdf.getvalue())
+                pdf_path = tmp_file.name
+            
+            try:
+                # Process the PDF
+                reader = PdfReader(pdf_path)
+                st.session_state.number_of_pages = len(reader.pages)
+                st.session_state.pages_text = [page.extract_text() for page in reader.pages]
+                st.session_state.book_name = uploaded_pdf.name
+                st.success(f"PDF loaded with {st.session_state.number_of_pages} pages")
+            finally:
+                _safe_remove_file(pdf_path)
+                
+    with tab_history:
+        # Clear conversation
+        if st.button("Clear Conversation"):
+            st.session_state.message_history = []
+            st.success("Conversation history cleared!")
+        
+        st.subheader("Conversation History")
+        if st.session_state.message_history:
+            for i, msg in enumerate(st.session_state.message_history[-10:]):  # Show last 10 messages
+                role = "👤 You" if msg["role"] == "user" else "🤖 Claude"
+                st.text(f"{role}: {msg['content'][:50]}...")
+
 
 # Main app logic
 # Determine if the selected model requires a specific API key
@@ -1344,14 +1395,20 @@ else:
         if mode == "Text Chat (Mode 0)":
             st.header("Text Chat")
             
-            user_input = st.text_area("Your message:")
+            # Display history
+            for msg in st.session_state.message_history:
+                with st.chat_message(msg["role"]):
+                    st.markdown(_normalize_math_delimiters(msg["content"]))
             
-            if st.button("Send"):
-                if user_input:
-                    st.write(f"**You:** {user_input}")
-                    with st.spinner("AI is thinking..."):
-                        response = get_system_response(anthropic_client, xai_client, user_input)
-                    st.markdown(f"**AI:**\n\n{_normalize_math_delimiters(response)}")
+            if prompt := st.chat_input("Enter your message..."):
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+                
+                with st.chat_message("assistant"):
+                    with st.status("AI is thinking...", expanded=True) as status:
+                        response = get_system_response(anthropic_client, xai_client, prompt)
+                        status.update(label="Response generated", state="complete")
+                    st.markdown(_normalize_math_delimiters(response))
                     st.caption(_format_cost_line(st.session_state.get("last_response_cost")))
 
         # Mode 1: Audio Chat
@@ -1741,11 +1798,8 @@ else:
                         st.error(str(e) or "Please enter valid page ranges.")
 
 # Display conversation history
-st.sidebar.subheader("Conversation History")
-if st.session_state.message_history:
-    for i, msg in enumerate(st.session_state.message_history[-10:]):  # Show last 10 messages
-        role = "👤 You" if msg["role"] == "user" else "🤖 Claude"
-        st.sidebar.text(f"{role}: {msg['content'][:50]}...")
+# Moved to sidebar tab in Config
+
 
 
 
