@@ -15,22 +15,43 @@ import sys
 import json
 import hashlib
 import tempfile
-import uuid
-from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from streamlit_mic_recorder import mic_recorder
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 
+from google_auth import (
+    get_authenticated_name,
+    get_authenticated_user,
+    logout_user,
+    render_google_login,
+)
+from user_access_db import (
+    TRIAL_DAYS,
+    SUBSCRIPTION_DAYS,
+    compute_access_state,
+    get_or_create_user,
+    init_db,
+    record_donation,
+)
+
 load_dotenv(override=True)  
 
-anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-grok_api_key = os.getenv("XAI_API_KEY") 
+# Determine if running locally (not deployed on Fly.io)
+is_local = os.getenv("FLY_APP_NAME") is None
+
+if is_local:
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+    grok_api_key = os.getenv("XAI_API_KEY") 
+else:
+    anthropic_api_key = ""
+    grok_api_key = ""
 
 APP_TEMP_DIR = os.path.join(tempfile.gettempdir(), "academic_learning_assistant")
 TEMP_FILE_MAX_AGE_SECONDS = 60 * 60 * 6
-USER_ACCESS_FILE = os.path.join(os.path.dirname(__file__), "user_access.json")
-TRIAL_DAYS = 15
 PAYPAL_DONATE_URL = os.getenv("PAYPAL_DONATE_URL") or "https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=carabelea.andrei@gmail.com&item_name=Academic+Learning+Assistant+Support&currency_code=USD"
+
+init_db()
 
 #second change
 
@@ -293,198 +314,10 @@ def _purge_stale_temp_files(max_age_seconds=TEMP_FILE_MAX_AGE_SECONDS):
 _purge_stale_temp_files()
 
 
-def _utcnow_iso():
-    return datetime.now(timezone.utc).isoformat()
+def _build_paypal_donate_url(user_email):
+    separator = "&" if "?" in PAYPAL_DONATE_URL else "?"
+    return f"{PAYPAL_DONATE_URL}{separator}custom={quote(user_email)}"
 
-
-def _parse_iso_utc(value):
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except Exception:
-        return None
-
-
-def _detect_device_type(user_agent):
-    ua = (user_agent or "").lower()
-    if any(token in ua for token in ["mobile", "iphone", "android"]):
-        return "mobile"
-    if any(token in ua for token in ["ipad", "tablet"]):
-        return "tablet"
-    return "desktop"
-
-
-def _get_header_value(headers, key_name):
-    if not headers:
-        return ""
-    for key, value in headers.items():
-        if str(key).lower() == key_name.lower():
-            return str(value)
-    return ""
-
-
-def _get_remote_ip():
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        from streamlit.runtime import get_instance
-        ctx = get_script_run_ctx()
-        if ctx is None:
-            return None
-        runtime = get_instance()
-        session_info = runtime._session_mgr.get_active_session_info(ctx.session_id)
-        if session_info is not None:
-            # session_info.session.ws might contain the websocket request
-            # For Streamlit >= 1.12.0
-            ws = getattr(session_info, "ws", None)
-            if ws is not None:
-                req = getattr(ws, "request", None)
-                if req is not None:
-                    return req.remote_ip
-    except Exception:
-        pass
-    return None
-
-def _get_client_context():
-    context = getattr(st, "context", None)
-    headers = getattr(context, "headers", {}) if context else {}
-
-    forwarded_for = _get_header_value(headers, "x-forwarded-for")
-    real_ip = _get_header_value(headers, "x-real-ip")
-    remote_addr = _get_header_value(headers, "remote-addr")
-    ws_ip = _get_remote_ip()
-
-    candidates = []
-    if forwarded_for:
-        candidates.extend([x.strip() for x in forwarded_for.split(",")])
-    if real_ip:
-        candidates.append(real_ip.strip())
-    if remote_addr:
-        candidates.append(remote_addr.strip())
-    if ws_ip:
-        candidates.append(ws_ip.strip())
-
-    ip = "unknown-ip"
-    # Filter out common local/server IPs. 
-    # If the app is behind a reverse proxy, ws_ip is often 127.0.0.1.
-    # We prefer a real public IP from headers. If none exist, we fall back to "unknown-ip"
-    # so the app uses the device/cookie fallback instead of merging everyone under 127.0.0.1.
-    loopbacks = {"127.0.0.1", "::1", "localhost", "0.0.0.0"}
-    for c in candidates:
-        if c and c not in loopbacks:
-            ip = c
-            break
-
-    user_agent = _get_header_value(headers, "user-agent") or "unknown-agent"
-    device_type = _detect_device_type(user_agent)
-
-    qp = st.query_params
-    browser_cookie = qp.get("vid", "")
-    if not browser_cookie:
-        browser_cookie = uuid.uuid4().hex
-        st.query_params["vid"] = browser_cookie
-
-    return {
-        "ip": ip,
-        "user_agent": user_agent,
-        "device_type": device_type,
-        "browser_cookie": browser_cookie,
-    }
-
-
-def _build_user_id(client_ctx):
-    ip = client_ctx.get("ip", "")
-    # If a real IP was found, use it exclusively to group the user.
-    # If IP retrieval failed, fallback to identifying by device and cookie.
-    if not ip or ip == "unknown-ip":
-        raw = f"fallback|{client_ctx.get('device_type', '')}|{client_ctx.get('browser_cookie', '')}"
-    else:
-        raw = f"{ip}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _load_access_data():
-    if not os.path.exists(USER_ACCESS_FILE):
-        return {"users": {}}
-    try:
-        with open(USER_ACCESS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, dict) and isinstance(data.get("users"), dict):
-                return data
-    except Exception:
-        pass
-    return {"users": {}}
-
-
-def _save_access_data(data):
-    with open(USER_ACCESS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-def _get_or_create_user_record(user_id, client_ctx):
-    data = _load_access_data()
-    users = data.setdefault("users", {})
-    now_iso = _utcnow_iso()
-
-    if user_id not in users:
-        users[user_id] = {
-            "created_at": now_iso,
-            "trial_started_at": now_iso,
-            "trial_days": TRIAL_DAYS,
-            "donation_unlocked": False,
-            "donation_unlocked_at": None,
-            "last_seen_at": now_iso,
-            "ip": client_ctx["ip"],
-            "device_type": client_ctx["device_type"],
-            "browser_cookie": client_ctx["browser_cookie"],
-            "user_agent": client_ctx["user_agent"],
-        }
-    else:
-        users[user_id]["last_seen_at"] = now_iso
-        users[user_id]["ip"] = client_ctx["ip"]
-        users[user_id]["device_type"] = client_ctx["device_type"]
-        users[user_id]["browser_cookie"] = client_ctx["browser_cookie"]
-        users[user_id]["user_agent"] = client_ctx["user_agent"]
-
-    _save_access_data(data)
-    return users[user_id]
-
-
-def _compute_access_state(user_record):
-    started_at = _parse_iso_utc(user_record.get("trial_started_at"))
-    if started_at is None:
-        started_at = datetime.now(timezone.utc)
-
-    trial_days = int(user_record.get("trial_days", TRIAL_DAYS) or TRIAL_DAYS)
-    trial_end = started_at + timedelta(days=trial_days)
-    now = datetime.now(timezone.utc)
-
-    trial_active = now <= trial_end
-    donation_unlocked = bool(user_record.get("donation_unlocked", False))
-    full_access = trial_active or donation_unlocked
-
-    remaining = trial_end - now
-    days_left = max(0, remaining.days + (1 if remaining.seconds > 0 else 0))
-
-    return {
-        "trial_active": trial_active,
-        "donation_unlocked": donation_unlocked,
-        "full_access": full_access,
-        "days_left": days_left,
-        "trial_end": trial_end,
-    }
-
-
-def _mark_current_user_donated(user_id):
-    data = _load_access_data()
-    users = data.setdefault("users", {})
-    user = users.get(user_id)
-    if not user:
-        return False
-    user["donation_unlocked"] = True
-    user["donation_unlocked_at"] = _utcnow_iso()
-    _save_access_data(data)
-    return True
 
 def extract_number(text):
     """
@@ -1203,6 +1036,15 @@ def _write_wav_bytes_to_tempfile(wav_bytes, prefix="recording_"):
 st.title("Academic Learning Assistant")
 st.markdown("<h1 style='text-align: center;'></h1>", unsafe_allow_html=True)
 
+user_email = get_authenticated_user()
+if not user_email:
+    render_google_login()
+    st.stop()
+
+user_name = get_authenticated_name() or user_email
+user_record = get_or_create_user(user_email, name=user_name)
+access_state = compute_access_state(user_record)
+
 # ---------------------------------------------------------------------------
 # Inject MathJax for LaTeX rendering (handles $...$ and $$...$$ delimiters)
 # ---------------------------------------------------------------------------
@@ -1246,10 +1088,22 @@ window.MathJax = {
 
 # Sidebar for configuration
 with st.sidebar:
+    st.caption(f"Signed in as **{user_email}**")
+    if st.button("Sign out", key="sign_out_button"):
+        logout_user()
+        st.rerun()
+
+    st.divider()
+
     # ---------------------------------------------------------------------------
     # Configuration Tabs
     # ---------------------------------------------------------------------------
-    tab_settings, tab_pdf, tab_history = st.tabs(["⚙️ Settings", "📄 PDF", "📜 History"])
+    tab_settings, tab_pdf, tab_history, tab_guide = st.tabs([
+        "⚙️ Settings",
+        "📄 PDF",
+        "📜 History",
+        "📖 Guide",
+    ])
     
     with tab_settings:
         st.header("Configuration")
@@ -1276,41 +1130,55 @@ with st.sidebar:
                 st.rerun()
 
         st.divider()
-        st.subheader("Access & Trial")
-        client_ctx = _get_client_context()
-        user_id = _build_user_id(client_ctx)
-        user_record = _get_or_create_user_record(user_id, client_ctx)
-        access_state = _compute_access_state(user_record)
-
+        st.subheader("Access & Subscription")
         if access_state["trial_active"]:
-            st.info(f"Free trial active: {access_state['days_left']} day(s) remaining.")
-        elif access_state["donation_unlocked"]:
-            st.success("Full access unlocked by donation.")
+            st.info(
+                f"Free trial active: {access_state['days_left']} day(s) remaining "
+                f"({TRIAL_DAYS}-day trial)."
+            )
+        elif access_state["subscription_active"]:
+            st.success(
+                f"Full access active: {access_state['days_left']} day(s) remaining "
+                f"on your monthly subscription."
+            )
         else:
-            st.warning("Trial ended. Modes 2-6 are locked until donation.")
+            st.warning(
+                "Trial ended. Only Mode 0 and Mode 1 are available. "
+                f"Donate to unlock all modes for {SUBSCRIPTION_DAYS} days."
+            )
 
-        if not access_state["donation_unlocked"]:
+        needs_donation = not access_state["full_access"] or access_state["subscription_active"]
+        if needs_donation or not access_state["trial_active"]:
+            paypal_url = _build_paypal_donate_url(user_email)
             if PAYPAL_DONATE_URL:
-                # Custom button that updates session state when clicked
                 if st.button("Donate with PayPal"):
                     st.session_state.donation_clicked = True
-                    # Use a JavaScript hack to open the URL in a new tab because link_button return value isn't reliable for logic
-                    js = f"window.open('{PAYPAL_DONATE_URL}')"
+                    js = f"window.open({json.dumps(paypal_url)})"
                     st.components.v1.html(f"<script>{js}</script>", height=0)
                     st.rerun()
-                st.caption("You can choose any amount (e.g., $5, $7, or more).")
+                st.caption(
+                    f"Each donation unlocks all modes for {SUBSCRIPTION_DAYS} days. "
+                    "Donate again before it expires to keep full access."
+                )
             else:
                 st.info("Set PAYPAL_DONATE_URL in .env to enable the donation button.")
 
-            # Only show "I Donated" if the user has clicked the donation link in this session
-            if st.session_state.get('donation_clicked', False):
-                if st.button("I Donated", help="Click this after completing your donation on PayPal"):
-                    if _mark_current_user_donated(user_id):
-                        st.success("Thank you! Full access unlocked.")
+            if st.session_state.get("donation_clicked", False):
+                if st.button(
+                    "I Donated",
+                    help="Click this after completing your donation on PayPal",
+                ):
+                    if record_donation(user_email):
+                        st.session_state.donation_clicked = False
+                        st.success(
+                            f"Thank you! All modes unlocked for {SUBSCRIPTION_DAYS} days."
+                        )
                         st.rerun()
                     st.error("Unable to update donation status. Please try again.")
-            else:
-                st.caption("Once you click the donation link above, the 'I Donated' button will appear to unlock your access.")
+            elif not access_state["full_access"]:
+                st.caption(
+                    "After donating on PayPal, click 'I Donated' to unlock your subscription."
+                )
 
         
         # Check if selected model is Anthropic and key is missing
@@ -1368,35 +1236,7 @@ with st.sidebar:
             finally:
                 _safe_remove_file(pdf_path)
         
-        st.divider()
-        st.subheader("📖 User Guide")
-        guide_text = f"""
-# 🎓 Academic Learning Assistant – User Guide
-
-Welcome to the **Academic Learning Assistant**, a powerful AI-driven tool designed to help students and researchers analyze academic texts, presentations, and mathematical formulas using state-of-the-art models.
-
----
-
-## ⚙️ 1. Configuration & Setup
-*   **AI Model**: Select your preferred provider (Anthropic or xAI) in the Settings tab.
-*   **PDF Upload**: Upload your document in this tab to enable analysis modes.
-
-## 🔓 2. Access & Trial
-*   **Trial**: New users get 15 days of full access.
-*   **Modes 0-1**: Always available for basic text and audio chat.
-*   **Modes 2-6**: Require an active trial or a donation to unlock. 
-*   **Donation**: Support the project with a $5.00 donation via the PayPal button in the **Settings** tab.
-
-## 🛠️ 3. Operating Modes
-*   **Mode 0 & 1**: Text and Audio chat for general academic teaching.
-*   **Mode 2 & 3**: Text or Audio based questioning of your uploaded PDF. Page numbers are entered manually.
-*   **Mode 4 (Presentation Analysis)**: Upload any audio (WAV/MP3) to get a structured scientific analysis and a downloadable HTML report.
-*   **Mode 5 (Summarizing)**: Compress specific page ranges by a selected percentage.
-*   **Mode 6 (Formula Extract)**: Automatically find and explain symbolic formulas using LaTeX.
-
----
-        """
-        st.markdown(guide_text)
+        st.caption("See the Guide tab for the full user guide and mode descriptions.")
                 
     with tab_history:
         # Clear conversation
@@ -1409,6 +1249,55 @@ Welcome to the **Academic Learning Assistant**, a powerful AI-driven tool design
             for i, msg in enumerate(st.session_state.message_history[-10:]):  # Show last 10 messages
                 role = "👤 You" if msg["role"] == "user" else "🤖 Claude"
                 st.text(f"{role}: {msg['content'][:50]}...")
+
+    with tab_guide:
+        st.header("User Guide")
+        st.markdown(
+            """
+This app helps you chat with AI, analyze PDFs, process audio, summarize documents, and extract formulas.
+
+**Setup**
+- Select an AI model in the Settings tab.
+- Enter your own Anthropic or xAI API key in the Settings tab.
+- Upload a PDF in the PDF tab before using PDF-based modes.
+
+**Access**
+- Sign in with Google (Gmail) to use the app.
+- New users get a 15-day full-access trial.
+- Modes 0 and 1 are always available after the trial ends.
+- Modes 2 to 6 require an active trial or a monthly PayPal donation (30 days per donation).
+
+**Shared context across modes**
+- You can switch between modes without losing conversation context.
+- Example: after asking questions about a PDF, you can switch to Text Chat (Mode 0) and continue the discussion without resending the same context.
+- This reduces unnecessary token usage and helps avoid extra cost.
+
+**Math support**
+- All modes can process mathematical formulas and display them in a human-readable format.
+- Mathematical expressions are rendered with LaTeX when possible.
+
+**Audio transcription editing**
+- In audio-based modes, the app transcribes speech first.
+- You can edit the transcribed text before sending it to the AI, which helps correct transcription mistakes.
+
+**Cost visibility**
+- The estimated AI cost is shown below each AI-generated answer.
+
+**Modes**
+- Mode 0: Text Chat. Standard text-based conversation with the AI for explanations, follow-up questions, and general academic discussion.
+- Mode 1: Audio Chat. Record a question with your microphone, review and edit the transcription, then send it to the AI.
+- Mode 2: Text-PDF Analysis. Ask text questions about an uploaded PDF and point the app to a relevant page number.
+- Mode 3: Audio-PDF Analysis. Record a spoken question about an uploaded PDF, edit the transcription, confirm the page number, and then get an answer.
+- Mode 4: Presentation Audio Analysis. Upload any audio file, including lectures, presentations, or podcast-style recordings such as a Joe Rogan episode, and generate a structured analysis with downloadable HTML output.
+- Mode 5: Summarizing. Summarize selected PDF page ranges using a compression percentage that you choose.
+- Mode 6: Formula_Summarizing. Extract symbolic formulas from selected PDF page ranges and return each one with a short explanation.
+
+**Tips**
+- For PDF workflows, upload the PDF first and confirm the correct page ranges or page number.
+- For long audio files, transcription may take several minutes.
+- Costs depend on the selected model and the amount of text or audio processed.
+"""
+        )
 
 
 # Main app logic
@@ -1474,7 +1363,10 @@ else:
         available_modes = all_modes if access_state.get("full_access") else free_modes
 
         if not access_state.get("full_access"):
-            st.warning("Trial ended. Only Mode 0 and Mode 1 are available until donation unlock.")
+            st.warning(
+                f"Only Mode 0 and Mode 1 are available. "
+                f"Donate via PayPal to unlock all modes for {SUBSCRIPTION_DAYS} days."
+            )
 
         mode = st.selectbox(
             "Select Mode", 
