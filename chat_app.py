@@ -942,6 +942,24 @@ def get_audio_hash(audio_file_path):
         file_hash = hashlib.md5(f.read()).hexdigest()
     return file_hash
 
+
+@st.cache_resource(show_spinner=False)
+def load_cached_whisper_model(model_type, device="cpu"):
+    """
+    Cache the loaded Whisper model to prevent reloading on every invocation,
+    which saves significant CPU and memory, preventing OOM restarts.
+    """
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            return whisper.load_model(model_type, device=device)
+        except RuntimeError as e:
+            if "Failed to load tokenizer" in str(e) and attempt < max_attempts - 1:
+                time.sleep(2 ** attempt)  # exponential backoff
+            else:
+                raise
+
+
 def transcribe_audio(audio_file_path, model_type="base", language=None, use_cache=False):
     """
     Transcribe audio with optional caching to avoid repeated transcriptions
@@ -971,19 +989,8 @@ def transcribe_audio(audio_file_path, model_type="base", language=None, use_cach
             st.warning("Audio too short, skipping transcription.")
             return {"text": "", "segments": []}
         
-        # Ensure model is loaded with retry for tokenizer download issues
-        max_attempts = 3
-        whisper_model = None
-        for attempt in range(max_attempts):
-            try:
-                whisper_model = whisper.load_model(model_type, device="cpu")
-                break
-            except RuntimeError as e:
-                if "Failed to load tokenizer" in str(e) and attempt < max_attempts - 1:
-                    st.warning(f"Tokenizer loading failed, retrying... ({attempt + 1}/{max_attempts})")
-                    time.sleep(2 ** attempt)  # exponential backoff
-                else:
-                    raise
+        # Load cached model
+        whisper_model = load_cached_whisper_model(model_type, device="cpu")
         
         # Perform transcription
         try:

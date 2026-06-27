@@ -75,6 +75,44 @@ def _verify_signed_state(state, max_age_seconds=900):
     return (time.time() - ts) <= max_age_seconds
 
 
+def _make_signed_session(email, name):
+    payload = {
+        "email": email,
+        "name": name,
+        "ts": int(time.time()),
+    }
+    payload_b64 = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("utf-8")
+    signature = hmac.new(
+        OAUTH_STATE_SECRET.encode("utf-8"),
+        payload_b64.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload_b64}.{signature}"
+
+
+def _verify_signed_session(token, max_age_seconds=86400 * 30):
+    if not token or "." not in token:
+        return None
+    try:
+        payload_b64, signature = token.rsplit(".", 1)
+        expected = hmac.new(
+            OAUTH_STATE_SECRET.encode("utf-8"),
+            payload_b64.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            return None
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")))
+        ts = int(payload.get("ts", 0))
+        if (time.time() - ts) > max_age_seconds:
+            return None
+        return payload.get("email"), payload.get("name")
+    except Exception:
+        return None
+
+
 def _build_flow():
     return Flow.from_client_config(
         {
@@ -147,6 +185,7 @@ def _handle_oauth_callback():
         email, name = _extract_user_from_credentials(flow.credentials)
         st.session_state[SESSION_EMAIL_KEY] = email
         st.session_state[SESSION_NAME_KEY] = name
+        st.query_params["session"] = _make_signed_session(email, name)
         _clear_oauth_query_params()
         st.rerun()
     except Exception as exc:
@@ -158,6 +197,20 @@ def _handle_oauth_callback():
 def get_authenticated_user():
     if SESSION_EMAIL_KEY in st.session_state:
         return st.session_state[SESSION_EMAIL_KEY]
+
+    session_token = st.query_params.get("session")
+    if session_token:
+        res = _verify_signed_session(session_token)
+        if res:
+            email, name = res
+            st.session_state[SESSION_EMAIL_KEY] = email
+            st.session_state[SESSION_NAME_KEY] = name
+            return email
+        else:
+            try:
+                del st.query_params["session"]
+            except KeyError:
+                pass
 
     if _handle_oauth_callback():
         return st.session_state.get(SESSION_EMAIL_KEY)
@@ -173,6 +226,11 @@ def logout_user():
     for key in (SESSION_EMAIL_KEY, SESSION_NAME_KEY, "donation_clicked"):
         st.session_state.pop(key, None)
     _clear_oauth_query_params()
+    if "session" in st.query_params:
+        try:
+            del st.query_params["session"]
+        except KeyError:
+            pass
 
 
 def build_google_sign_in_url():
