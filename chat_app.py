@@ -1245,6 +1245,7 @@ with st.sidebar:
         uploaded_pdf = st.file_uploader("Upload a PDF", type="pdf")
         
         if uploaded_pdf:
+            st.info(f"File received by app: {uploaded_pdf.name} ({uploaded_pdf.size} bytes)")
             # Save to a temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf', dir=_ensure_app_temp_dir()) as tmp_file:
                 tmp_file.write(uploaded_pdf.getvalue())
