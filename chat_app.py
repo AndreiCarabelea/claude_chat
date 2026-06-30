@@ -1043,14 +1043,27 @@ def _write_wav_bytes_to_tempfile(wav_bytes, prefix="recording_"):
 st.title("Academic Learning Assistant")
 st.markdown("<h1 style='text-align: center;'></h1>", unsafe_allow_html=True)
 
-user_email = get_authenticated_user()
-if not user_email:
-    render_google_login()
-    st.stop()
+if is_local:
+    user_email = "local_test_user@localhost"
+    user_name = "Local Test User"
+    access_state = {
+        "full_access": True,
+        "trial_active": True,
+        "subscription_active": False,
+        "days_left": 9999,
+        "access_type": "trial",
+        "trial_end": None,
+        "subscription_end": None,
+    }
+else:
+    user_email = get_authenticated_user()
+    if not user_email:
+        render_google_login()
+        st.stop()
 
-user_name = get_authenticated_name() or user_email
-user_record = get_or_create_user(user_email, name=user_name)
-access_state = compute_access_state(user_record)
+    user_name = get_authenticated_name() or user_email
+    user_record = get_or_create_user(user_email, name=user_name)
+    access_state = compute_access_state(user_record)
 
 # ---------------------------------------------------------------------------
 # Inject MathJax for LaTeX rendering (handles $...$ and $$...$$ delimiters)
@@ -1096,9 +1109,10 @@ window.MathJax = {
 # Sidebar for configuration
 with st.sidebar:
     st.caption(f"Signed in as **{user_email}**")
-    if st.button("Sign out", key="sign_out_button"):
-        logout_user()
-        st.rerun()
+    if not is_local:
+        if st.button("Sign out", key="sign_out_button"):
+            logout_user()
+            st.rerun()
 
     st.divider()
 
@@ -1138,54 +1152,57 @@ with st.sidebar:
 
         st.divider()
         st.subheader("Access & Subscription")
-        if access_state["trial_active"]:
-            st.info(
-                f"Free trial active: {access_state['days_left']} day(s) remaining "
-                f"({TRIAL_DAYS}-day trial)."
-            )
-        elif access_state["subscription_active"]:
-            st.success(
-                f"Full access active: {access_state['days_left']} day(s) remaining "
-                f"on your monthly subscription."
-            )
+        if is_local:
+            st.success("Local development mode: All modes unlocked and free.")
         else:
-            st.warning(
-                "Trial ended. Only Mode 0 and Mode 1 are available. "
-                f"Donate to unlock all modes for {SUBSCRIPTION_DAYS} days."
-            )
-
-        needs_donation = not access_state["full_access"] or access_state["subscription_active"]
-        if needs_donation or not access_state["trial_active"]:
-            paypal_url = _build_paypal_donate_url(user_email)
-            if PAYPAL_DONATE_URL:
-                if st.button("Donate with PayPal"):
-                    st.session_state.donation_clicked = True
-                    js = f"window.open({json.dumps(paypal_url)})"
-                    st.components.v1.html(f"<script>{js}</script>", height=0)
-                    st.rerun()
-                st.caption(
-                    f"Each donation unlocks all modes for {SUBSCRIPTION_DAYS} days. "
-                    "Donate again before it expires to keep full access."
+            if access_state["trial_active"]:
+                st.info(
+                    f"Free trial active: {access_state['days_left']} day(s) remaining "
+                    f"({TRIAL_DAYS}-day trial)."
+                )
+            elif access_state["subscription_active"]:
+                st.success(
+                    f"Full access active: {access_state['days_left']} day(s) remaining "
+                    f"on your monthly subscription."
                 )
             else:
-                st.info("Set PAYPAL_DONATE_URL in .env to enable the donation button.")
-
-            if st.session_state.get("donation_clicked", False):
-                if st.button(
-                    "I Donated",
-                    help="Click this after completing your donation on PayPal",
-                ):
-                    if record_donation(user_email):
-                        st.session_state.donation_clicked = False
-                        st.success(
-                            f"Thank you! All modes unlocked for {SUBSCRIPTION_DAYS} days."
-                        )
-                        st.rerun()
-                    st.error("Unable to update donation status. Please try again.")
-            elif not access_state["full_access"]:
-                st.caption(
-                    "After donating on PayPal, click 'I Donated' to unlock your subscription."
+                st.warning(
+                    "Trial ended. Only Mode 0 and Mode 1 are available. "
+                    f"Donate to unlock all modes for {SUBSCRIPTION_DAYS} days."
                 )
+
+            needs_donation = not access_state["full_access"] or access_state["subscription_active"]
+            if needs_donation or not access_state["trial_active"]:
+                paypal_url = _build_paypal_donate_url(user_email)
+                if PAYPAL_DONATE_URL:
+                    if st.button("Donate with PayPal"):
+                        st.session_state.donation_clicked = True
+                        js = f"window.open({json.dumps(paypal_url)})"
+                        st.components.v1.html(f"<script>{js}</script>", height=0)
+                        st.rerun()
+                    st.caption(
+                        f"Each donation unlocks all modes for {SUBSCRIPTION_DAYS} days. "
+                        "Donate again before it expires to keep full access."
+                    )
+                else:
+                    st.info("Set PAYPAL_DONATE_URL in .env to enable the donation button.")
+
+                if st.session_state.get("donation_clicked", False):
+                    if st.button(
+                        "I Donated",
+                        help="Click this after completing your donation on PayPal",
+                    ):
+                        if record_donation(user_email):
+                            st.session_state.donation_clicked = False
+                            st.success(
+                                f"Thank you! All modes unlocked for {SUBSCRIPTION_DAYS} days."
+                            )
+                            st.rerun()
+                        st.error("Unable to update donation status. Please try again.")
+                elif not access_state["full_access"]:
+                    st.caption(
+                        "After donating on PayPal, click 'I Donated' to unlock your subscription."
+                    )
 
         
         # Check if selected model is Anthropic and key is missing
