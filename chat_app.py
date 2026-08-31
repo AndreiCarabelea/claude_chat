@@ -15,6 +15,7 @@ import sys
 import json
 import hashlib
 import tempfile
+import subprocess
 from urllib.parse import quote
 from streamlit_mic_recorder import mic_recorder
 from langchain_openai import ChatOpenAI
@@ -960,9 +961,13 @@ def load_cached_whisper_model(model_type, device="cpu"):
                 raise
 
 
-def transcribe_audio(audio_file_path, model_type="base", language=None, use_cache=False):
+def transcribe_audio(audio_file_path, model_type="base", language=None, use_cache=False, vad=False, report_progress=False):
     """
-    Transcribe audio with optional caching to avoid repeated transcriptions
+    Transcribe audio with optional caching to avoid repeated transcriptions.
+    vad: if True, run Voice Activity Detection (Silero) to skip non-speech
+    parts before transcription (helps with gaps, music, or noise).
+    report_progress: if True, transcribe in chunks and show a percentage
+    progress bar in the UI (used for long files).
     """
     if use_cache:
         file_hash = get_audio_hash(audio_file_path)
@@ -994,9 +999,13 @@ def transcribe_audio(audio_file_path, model_type="base", language=None, use_cach
         
         # Perform transcription
         try:
-            result = whisper.transcribe(whisper_model, audio, language=language,
-                                        compute_word_confidence=True,
-                                        no_speech_threshold=0.6)
+            if report_progress:
+                result = _transcribe_with_progress(whisper_model, audio, language, vad)
+            else:
+                result = whisper.transcribe(whisper_model, audio, language=language,
+                                            compute_word_confidence=False,
+                                            no_speech_threshold=0.6,
+                                            vad=vad)
         except IndexError as e:
             st.error(f"IndexError in whisper_timestamped: {e}")
             st.write(f"Audio length: {len(audio)}, duration: {len(audio)/16000:.2f}s")
@@ -1010,6 +1019,84 @@ def transcribe_audio(audio_file_path, model_type="base", language=None, use_cach
                 json.dump(result, f, ensure_ascii=False, indent=2)
         
         return result
+
+
+def _transcribe_with_progress(whisper_model, audio, language, vad, chunk_seconds=600, overlap_seconds=5):
+    """
+    Transcribe audio in fixed-size chunks and report progress as a percentage
+    via a Streamlit progress bar. Returns the same result structure as
+    whisper_timestamped.transcribe ({text, segments}).
+
+    Chunking gives real progress feedback for long files. Each chunk keeps the
+    VAD setting, and segment timestamps are offset back to the full audio
+    timeline. A small overlap avoids cutting words at chunk boundaries.
+    """
+    sample_rate = 16000
+    chunk_len = chunk_seconds * sample_rate
+    overlap = overlap_seconds * sample_rate
+    total_samples = len(audio)
+    total_chunks = max(1, ceil(total_samples / chunk_len))
+
+    progress_bar = st.progress(0, text="Transcribing... 0%")
+    all_segments = []
+    texts = []
+    chunk_index = 0
+    for start in range(0, total_samples, chunk_len):
+        end = min(total_samples, start + chunk_len + overlap)
+        chunk = audio[start:end]
+        chunk_index += 1
+        if len(chunk) < 8000:  # skip empty/too-short remainder
+            continue
+
+        result = whisper.transcribe(whisper_model, chunk, language=language,
+                                    compute_word_confidence=False,
+                                    no_speech_threshold=0.6,
+                                    vad=vad)
+        for seg in result.get("segments", []):
+            seg["start"] += start / sample_rate
+            seg["end"] += start / sample_rate
+            all_segments.append(seg)
+        texts.append(result.get("text", ""))
+
+        pct = int(chunk_index / total_chunks * 100)
+        progress_bar.progress(min(pct, 100) / 100.0, text=f"Transcribing... {pct}%")
+
+    progress_bar.empty()
+    return {"text": "".join(texts).strip(), "segments": all_segments}
+
+
+def _maybe_convert_wav_to_mp3(audio_path):
+    """
+    Convert an uploaded WAV file to MP3 before transcription to save disk
+    space and speed up processing. MP3 files are returned unchanged.
+    Returns the path of the file to transcribe.
+    """
+    if not audio_path.lower().endswith(".wav"):
+        return audio_path
+
+    mp3_path = os.path.splitext(audio_path)[0] + "_converted.mp3"
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", audio_path,
+                "-codec:a", "libmp3lame", "-b:a", "128k",
+                mp3_path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        st.warning(
+            f"WAV-to-MP3 conversion failed ({e}). "
+            f"Continuing with the original WAV file."
+        )
+        return audio_path
+
+    # Original WAV is no longer needed once the MP3 was created
+    _safe_remove_file(audio_path)
+    st.info("WAV file converted to MP3 for faster processing.")
+    return mp3_path
 
 
 def _extract_wav_bytes(mic_output):
@@ -1313,7 +1400,7 @@ This app helps you chat with AI, analyze PDFs, process audio, summarize document
 - Mode 1: Audio Chat. Record a question with your microphone, review and edit the transcription, then send it to the AI.
 - Mode 2: Text-PDF Analysis. Ask text questions about an uploaded PDF and point the app to a relevant page number.
 - Mode 3: Audio-PDF Analysis. Record a spoken question about an uploaded PDF, edit the transcription, confirm the page number, and then get an answer.
-- Mode 4: Presentation Audio Analysis. Upload any audio file, including lectures, presentations, or podcast-style recordings such as a Joe Rogan episode, and generate a structured analysis with downloadable HTML output.
+- Mode 4: Presentation Audio Analysis. Upload any audio file, including lectures, presentations, or podcast-style recordings such as a Joe Rogan episode, and generate a structured analysis with downloadable HTML output. MP3 is recommended for long recordings; WAV uploads are automatically converted to MP3.
 - Mode 5: Summarizing. Summarize selected PDF page ranges using a compression percentage that you choose.
 - Mode 6: Formula_Summarizing. Extract symbolic formulas from selected PDF page ranges and return each one with a short explanation.
 
@@ -1626,7 +1713,13 @@ else:
             st.header("Presentation Audio Analysis")
             
             # Upload presentation audio
-            uploaded_audio = st.file_uploader("Upload presentation audio", type=["wav", "mp3"])
+            uploaded_audio = st.file_uploader(
+                "Upload presentation audio",
+                type=["wav", "mp3"],
+                help="MP3 is recommended for long recordings (fits roughly 3.5 hours "
+                     "within the 200 MB upload limit). WAV files are automatically "
+                     "converted to MP3 before transcription.",
+            )
             if uploaded_audio and st.button("Analyze Presentation"):
                 audio_suffix = os.path.splitext(uploaded_audio.name or "")[1] or ".wav"
                 with tempfile.NamedTemporaryFile(delete=False, suffix=audio_suffix, dir=_ensure_app_temp_dir()) as tmp_file:
@@ -1634,12 +1727,15 @@ else:
                     audio_path = tmp_file.name
 
                 try:
+                    # Convert WAV uploads to MP3; MP3 uploads are used as-is
+                    audio_path = _maybe_convert_wav_to_mp3(audio_path)
+
                     # Process the audio
                     with st.spinner("Transcribing audio... This may take several minutes for long recordings."):
                         supported_models = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large"]
                         whisper_model_type = supported_models[0]
                         
-                        result = transcribe_audio(audio_path, whisper_model_type, "en", use_cache=True)
+                        result = transcribe_audio(audio_path, whisper_model_type, "en", use_cache=True, vad=True, report_progress=True)
                         transcription_text = result["text"]
                     
                     st.success("Transcription complete!")
