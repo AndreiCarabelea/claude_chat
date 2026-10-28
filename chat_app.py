@@ -16,7 +16,6 @@ import json
 import hashlib
 import tempfile
 import subprocess
-from urllib.parse import quote
 from streamlit_mic_recorder import mic_recorder
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
@@ -50,7 +49,9 @@ else:
 
 APP_TEMP_DIR = os.path.join(tempfile.gettempdir(), "academic_learning_assistant")
 TEMP_FILE_MAX_AGE_SECONDS = 60 * 60 * 6
-PAYPAL_DONATE_URL = os.getenv("PAYPAL_DONATE_URL") or "https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=carabelea.andrei@gmail.com&item_name=Academic+Learning+Assistant+Support&currency_code=USD"
+PAYPAL_DONATE_URL = os.getenv("PAYPAL_DONATE_URL") or "https://www.paypal.com/ncp/payment/XWYLY3U4RCJXG"
+ETH_DONATE_ADDRESS = os.getenv("ETH_DONATE_ADDRESS") or "0x7b0164402142b945b8b3d47d901c0702e042a64c"
+GA_MEASUREMENT_ID = os.getenv("GA_MEASUREMENT_ID") or "G-58E8JBJ2DZ"
 
 init_db()
 
@@ -313,11 +314,6 @@ def _purge_stale_temp_files(max_age_seconds=TEMP_FILE_MAX_AGE_SECONDS):
 
 
 _purge_stale_temp_files()
-
-
-def _build_paypal_donate_url(user_email):
-    separator = "&" if "?" in PAYPAL_DONATE_URL else "?"
-    return f"{PAYPAL_DONATE_URL}{separator}custom={quote(user_email)}"
 
 
 def extract_number(text):
@@ -1126,7 +1122,44 @@ def _write_wav_bytes_to_tempfile(wav_bytes, prefix="recording_"):
     tmp.close()
     return tmp.name
 
+def inject_google_analytics():
+    """Load Google Analytics (gtag.js) on the deployed app.
+
+    st.components.v1.html renders inside a sandboxed iframe, so the gtag snippet
+    is injected into the parent document to track the real app page.
+    """
+    if is_local or not GA_MEASUREMENT_ID:
+        return
+
+    ga_snippet = f"""
+<script>
+(function() {{
+  var doc = window.parent.document;
+  if (doc.getElementById('ga-gtag-bootstrap')) {{
+    return;
+  }}
+  var loader = doc.createElement('script');
+  loader.id = 'ga-gtag-loader';
+  loader.async = true;
+  loader.src = 'https://www.googletagmanager.com/gtag/js?id={GA_MEASUREMENT_ID}';
+  doc.head.appendChild(loader);
+
+  var bootstrap = doc.createElement('script');
+  bootstrap.id = 'ga-gtag-bootstrap';
+  bootstrap.textContent =
+    "window.dataLayer = window.dataLayer || [];" +
+    "function gtag(){{dataLayer.push(arguments);}}" +
+    "gtag('js', new Date());" +
+    "gtag('config', '{GA_MEASUREMENT_ID}');";
+  doc.head.appendChild(bootstrap);
+}})();
+</script>
+"""
+    st.components.v1.html(ga_snippet, height=0)
+
+
 # Main Streamlit app
+inject_google_analytics()
 st.title("Academic Learning Assistant")
 st.markdown("<h1 style='text-align: center;'></h1>", unsafe_allow_html=True)
 
@@ -1260,11 +1293,10 @@ with st.sidebar:
 
             needs_donation = not access_state["full_access"] or access_state["subscription_active"]
             if needs_donation or not access_state["trial_active"]:
-                paypal_url = _build_paypal_donate_url(user_email)
                 if PAYPAL_DONATE_URL:
                     if st.button("Donate with PayPal"):
                         st.session_state.donation_clicked = True
-                        js = f"window.open({json.dumps(paypal_url)})"
+                        js = f"window.open({json.dumps(PAYPAL_DONATE_URL)})"
                         st.components.v1.html(f"<script>{js}</script>", height=0)
                         st.rerun()
                     st.caption(
@@ -1274,10 +1306,18 @@ with st.sidebar:
                 else:
                     st.info("Set PAYPAL_DONATE_URL in .env to enable the donation button.")
 
-                if st.session_state.get("donation_clicked", False):
+                if ETH_DONATE_ADDRESS:
+                    st.markdown("**Donate with ETH**")
+                    st.code(ETH_DONATE_ADDRESS, language=None)
+                    st.caption(
+                        f"Send ETH to this address to unlock all modes for {SUBSCRIPTION_DAYS} days."
+                    )
+
+                # Allow confirming a donation made via PayPal or ETH
+                if st.session_state.get("donation_clicked", False) or ETH_DONATE_ADDRESS:
                     if st.button(
                         "I Donated",
-                        help="Click this after completing your donation on PayPal",
+                        help="Click this after completing your donation",
                     ):
                         if record_donation(user_email):
                             st.session_state.donation_clicked = False
@@ -1288,7 +1328,7 @@ with st.sidebar:
                         st.error("Unable to update donation status. Please try again.")
                 elif not access_state["full_access"]:
                     st.caption(
-                        "After donating on PayPal, click 'I Donated' to unlock your subscription."
+                        "After donating, click 'I Donated' to unlock your subscription."
                     )
 
         
