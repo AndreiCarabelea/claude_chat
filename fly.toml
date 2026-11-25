@@ -1,0 +1,42 @@
+# fly.toml app configuration file generated for academic-learning-assistant on 2026-05-12T02:42:57+03:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'academic-learning-assistant'
+primary_region = 'ams'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  STREAMLIT_SERVER_ADDRESS = '0.0.0.0'
+  STREAMLIT_SERVER_ENABLE_CORS = 'false'
+  STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION = 'false'
+  STREAMLIT_SERVER_HEADLESS = 'true'
+  STREAMLIT_SERVER_MAX_UPLOAD_SIZE = '70'
+  STREAMLIT_SERVER_PORT = '8501'
+  DATA_DIR = '/data'
+  
+[http_service.concurrency]
+  type = "connections"
+  soft_limit = 8
+  hard_limit = 16
+
+[mounts]
+  source = 'app_data'
+  destination = '/var/lib/litefs'
+
+[http_service]
+  internal_port = 8501
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  memory = '1024mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  

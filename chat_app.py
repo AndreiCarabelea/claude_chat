@@ -43,9 +43,11 @@ is_local = os.getenv("FLY_APP_NAME") is None
 if is_local:
     anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
     grok_api_key = os.getenv("XAI_API_KEY") 
+    deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
 else:
     anthropic_api_key = ""
     grok_api_key = ""
+    deepseek_api_key = ""
 
 APP_TEMP_DIR = os.path.join(tempfile.gettempdir(), "academic_learning_assistant")
 TEMP_FILE_MAX_AGE_SECONDS = 60 * 60 * 6
@@ -61,27 +63,37 @@ init_db()
 
 # Define model options
 MODEL_OPTIONS = {
-    "Claude Haiku 4.5": "claude-haiku-4-5-20251001",
-    "Claude Sonnet 4.6": "claude-sonnet-4-6",
-    "Claude Opus 4.6": "claude-opus-4-6"
+    "Claude Haiku 5.5": "claude-haiku-5-5",
+    "Claude Sonnet 5.5": "claude-sonnet-5-5",
+    "Claude Opus 5.5": "claude-opus-5-5"
 }
 
 GROK_MODELS = {
+    "Grok 4.7": "grok-4.7",
     "Grok 4.3": "grok-4.3",
-    "Grok 4.1 Fast Reason": "grok-4-1-fast-reasoning",
-    "Grok 4.1 Fast Non-Reason": "grok-4-1-fast-non-reasoning"
 }
 
+DEEPSEEK_MODELS = {
+    "DeepSeek V4.1 Flash 1017": "deepseek-flash",
+}
+
+OPENAI_COMPATIBLE_MODELS = {**GROK_MODELS, **DEEPSEEK_MODELS}
+
 # Combine model options for easy reference
-ALL_MODEL_OPTIONS = {**MODEL_OPTIONS, **GROK_MODELS}
+ALL_MODEL_OPTIONS = {**MODEL_OPTIONS, **OPENAI_COMPATIBLE_MODELS}
 
 MODEL_PRICING_USD_PER_MILLION = {
-    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
-    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
-    "claude-opus-4-6": {"input": 15.00, "output": 75.00},
-    "grok-4.3": {"input": 2.00, "output": 8.00},
-    "grok-4-1-fast-reasoning": {"input": 5.00, "output": 20.00},
-    "grok-4-1-fast-non-reasoning": {"input": 1.50, "output": 6.00},
+    "claude-haiku-5-5": {
+        "input": 0.10,
+        "output": 0.50,
+        "input_over_100k": 0.50,
+        "output_over_100k": 2.50,
+    },
+    "claude-sonnet-5-5": {"input": 2.00, "output": 10.00},
+    "claude-opus-5-5": {"input": 4.00, "output": 20.00},
+    "grok-4.7": {"input": 2.00, "output": 6.00},
+    "grok-4.3": {"input": 1.25, "output": 2.50},
+    "deepseek-flash": {"input": 0.30, "cached_input": 0.006, "output": 1.20},
 }
 
 
@@ -91,13 +103,13 @@ def _extract_usage_from_response(response):
 
     usage = getattr(response, "usage", None)
     if usage is not None:
-        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
-        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        input_tokens = int(_usage_field(usage, "input_tokens", 0) or 0)
+        output_tokens = int(_usage_field(usage, "output_tokens", 0) or 0)
         # OpenAI/xAI style usage fields
         if not input_tokens:
-            input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            input_tokens = int(_usage_field(usage, "prompt_tokens", 0) or 0)
         if not output_tokens:
-            output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            output_tokens = int(_usage_field(usage, "completion_tokens", 0) or 0)
         return input_tokens, output_tokens
 
     usage_metadata = getattr(response, "usage_metadata", None)
@@ -124,11 +136,37 @@ def _extract_usage_from_response(response):
     return input_tokens, output_tokens
 
 
-def _build_cost_info(model_name, input_tokens, output_tokens):
+def _usage_field(usage, field_name, default=None):
+    if isinstance(usage, dict):
+        return usage.get(field_name, default)
+    return getattr(usage, field_name, default)
+
+
+def _extract_text_from_response(response):
+    """Return visible text blocks, ignoring non-text blocks such as Claude thinking."""
+    text_parts = []
+    for block in getattr(response, "content", None) or []:
+        if isinstance(block, dict):
+            block_type = block.get("type")
+            block_text = block.get("text")
+        else:
+            block_type = getattr(block, "type", None)
+            block_text = getattr(block, "text", None)
+
+        if block_type == "text" and isinstance(block_text, str):
+            text_parts.append(block_text)
+
+    if not text_parts:
+        raise ValueError("Anthropic response did not contain a text block.")
+    return "\n".join(text_parts)
+
+
+def _build_cost_info(model_name, input_tokens, output_tokens, cached_input_tokens=0):
     pricing = MODEL_PRICING_USD_PER_MILLION.get(model_name)
     info = {
         "model": model_name,
         "input_tokens": int(input_tokens or 0),
+        "cached_input_tokens": int(cached_input_tokens or 0),
         "output_tokens": int(output_tokens or 0),
         "input_price_per_million": None,
         "output_price_per_million": None,
@@ -140,9 +178,24 @@ def _build_cost_info(model_name, input_tokens, output_tokens):
     if not pricing:
         return info
 
-    input_price = float(pricing["input"])
-    output_price = float(pricing["output"])
-    input_cost = (info["input_tokens"] / 1_000_000) * input_price
+    is_over_100k = info["input_tokens"] > 100_000
+    input_price = float(
+        pricing.get("input_over_100k", pricing["input"])
+        if is_over_100k else pricing["input"]
+    )
+    output_price = float(
+        pricing.get("output_over_100k", pricing["output"])
+        if is_over_100k else pricing["output"]
+    )
+    cached_input_tokens = min(
+        int(info.get("cached_input_tokens", 0) or 0), info["input_tokens"]
+    )
+    uncached_input_tokens = info["input_tokens"] - cached_input_tokens
+    cached_input_price = float(pricing.get("cached_input", input_price))
+    input_cost = (
+        (uncached_input_tokens / 1_000_000) * input_price
+        + (cached_input_tokens / 1_000_000) * cached_input_price
+    )
     output_cost = (info["output_tokens"] / 1_000_000) * output_price
 
     info["input_price_per_million"] = input_price
@@ -153,39 +206,76 @@ def _build_cost_info(model_name, input_tokens, output_tokens):
     return info
 
 
+def _extract_cached_input_tokens(response):
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return 0
+
+    cached_tokens = _usage_field(usage, "prompt_cache_hit_tokens")
+    prompt_details = _usage_field(usage, "prompt_tokens_details")
+    if cached_tokens is None:
+        if isinstance(prompt_details, dict):
+            cached_tokens = prompt_details.get("cached_tokens", 0)
+        else:
+            cached_tokens = getattr(prompt_details, "cached_tokens", 0)
+    return int(cached_tokens or 0)
+
+
 def _cost_info_from_response(response):
     model_name = st.session_state.model_name
     input_tokens, output_tokens = _extract_usage_from_response(response)
-    return _build_cost_info(model_name, input_tokens, output_tokens)
+    return _build_cost_info(
+        model_name,
+        input_tokens,
+        output_tokens,
+        cached_input_tokens=_extract_cached_input_tokens(response),
+    )
 
 
-def _invoke_xai_chat(xai_client, system_text, user_text, max_tokens=2048, temperature=0.75):
-    """Call xAI directly through OpenAI-compatible client to avoid LangChain RunInfo UUID issues."""
-    response = xai_client.client.create(
-        model=st.session_state.model_name,
-        messages=[
+def _invoke_openai_compatible_chat(
+    xai_client,
+    system_text,
+    user_text,
+    max_tokens=2048,
+    temperature=0.75,
+    disable_deepseek_thinking=False,
+):
+    """Call xAI or DeepSeek through an OpenAI-compatible client."""
+    request_options = {
+        "model": st.session_state.model_name,
+        "messages": [
             {"role": "system", "content": system_text},
             {"role": "user", "content": user_text},
         ],
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if disable_deepseek_thinking and st.session_state.model_name in DEEPSEEK_MODELS.values():
+        request_options["extra_body"] = {"thinking": {"type": "disabled"}}
+    response = xai_client.client.create(**request_options)
 
     # Diagnostic signal for runtime validation
     response_id = getattr(response, "id", None)
     print(
-        f"[GROK_DEBUG] model={st.session_state.model_name} "
+        f"[LLM_DEBUG] model={st.session_state.model_name} "
         f"response_id_type={type(response_id).__name__}"
     )
 
     text = ""
+    finish_reason = None
     if getattr(response, "choices", None):
-        message = response.choices[0].message
+        choice = response.choices[0]
+        message = choice.message
         text = getattr(message, "content", "") or ""
+        finish_reason = getattr(choice, "finish_reason", None)
+
+    if finish_reason == "length":
+        st.warning("The model reached its output-token limit; this response may be incomplete.")
 
     return {
         "text": text,
         "cost_info": _cost_info_from_response(response),
+        "finish_reason": finish_reason,
     }
 
 
@@ -197,6 +287,7 @@ def _merge_cost_info(total_info, new_info):
 
     merged = dict(total_info)
     merged["input_tokens"] = int(merged.get("input_tokens", 0)) + int(new_info.get("input_tokens", 0))
+    merged["cached_input_tokens"] = int(merged.get("cached_input_tokens", 0)) + int(new_info.get("cached_input_tokens", 0))
     merged["output_tokens"] = int(merged.get("output_tokens", 0)) + int(new_info.get("output_tokens", 0))
 
     input_cost_a = merged.get("input_cost")
@@ -240,13 +331,15 @@ def _format_cost_line(cost_info):
     )
 # Initialize MODEL_NAME in session state if not already present
 if 'model_name' not in st.session_state:
-    st.session_state.model_name = MODEL_OPTIONS["Claude Sonnet 4.6"]  # Default model
+    st.session_state.model_name = MODEL_OPTIONS["Claude Sonnet 5.5"]  # Default model
 
 # Initialize session state variables
 if 'anthropic_api_key' not in st.session_state:
     st.session_state.anthropic_api_key = anthropic_api_key
 if 'xai_api_key' not in st.session_state:
     st.session_state.xai_api_key = grok_api_key
+if 'deepseek_api_key' not in st.session_state:
+    st.session_state.deepseek_api_key = deepseek_api_key
 if 'message_history' not in st.session_state:
     st.session_state.message_history = []
 if 'pages_text' not in st.session_state:
@@ -350,7 +443,72 @@ def _normalize_math_delimiters(text):
     if not text:
         return text
 
-    # Already contains math delimiters — skip to avoid double-wrapping
+    text = text.strip()
+    # Models sometimes fence the entire answer as code, which prevents math rendering.
+    text = re.sub(r"^```(?:latex|tex|markdown)?\s*\n", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n```\s*$", "", text)
+
+    # Convert display equations wrapped in plain square brackets, as in [ x = y ].
+    def _wrap_bracketed_equation(match):
+        formula = match.group(1).strip()
+        if "$" in formula or not re.search(r"=|\\[A-Za-z]+", formula):
+            return match.group(0)
+        formula = re.sub(r"\s*\n\s*", " ", formula)
+        return f"$$\n{formula}\n$$"
+
+    text = re.sub(
+        r"(?<!\\)\[\s*([^\[\]]+?)\s*(?<!\\)\]",
+        _wrap_bracketed_equation,
+        text,
+        flags=re.DOTALL,
+    )
+
+    # Convert parenthesized math expressions like (R^f_{t+1}) to inline math,
+    # while leaving ordinary prose parentheses alone.
+    protected_math = [
+        match.span()
+        for match in re.finditer(
+            r"\$\$.*?\$\$|\$(?!\$).*?\$|\\\[.*?\\\]|\\\(.*?\\\)",
+            text,
+            flags=re.DOTALL,
+        )
+    ]
+    parenthesis_spans = []
+    open_parens = []
+    for index, char in enumerate(text):
+        if char == "(" and (index == 0 or text[index - 1] != "\\"):
+            open_parens.append(index)
+        elif char == ")" and open_parens and (index == 0 or text[index - 1] != "\\"):
+            parenthesis_spans.append((open_parens.pop(), index))
+
+    wrapped_spans = []
+    replacements = []
+    common_math_words = {
+        "arg", "cos", "cov", "det", "diag", "exp", "lim", "ln", "log",
+        "max", "min", "pr", "rank", "sin", "sup", "tan", "tr", "var",
+    }
+    for start, end in sorted(parenthesis_spans, key=lambda span: (span[0], -span[1])):
+        if any(a <= start and end <= b for a, b in protected_math + wrapped_spans):
+            continue
+
+        formula = text[start + 1:end].strip()
+        has_math_syntax = re.search(r"\\[A-Za-z]+|[_^=<>]", formula)
+        if not formula or not has_math_syntax or "$" in formula:
+            continue
+
+        plain_text = re.sub(r"\\[A-Za-z]+", "", formula)
+        words = re.findall(r"\b[A-Za-z]{3,}\b", plain_text)
+        if any(word.lower() not in common_math_words for word in words):
+            continue
+
+        formula = re.sub(r"\s*\n\s*", " ", formula)
+        wrapped_spans.append((start, end))
+        replacements.append((start, end, f"$({formula})$"))
+
+    for start, end, replacement in sorted(replacements, key=lambda item: item[0], reverse=True):
+        text = text[:start] + replacement + text[end + 1:]
+
+    # Already-delimited formulas can stay as-is after the wrapped forms above.
     if "$" in text:
         return text
 
@@ -510,18 +668,17 @@ def get_completion_pdf(anthropic_client, xai_client, simple_prompt, page_number,
         response = anthropic_client.messages.create(
             model=st.session_state.model_name,
             max_tokens=2048,
-            temperature=0.75,
             system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical formulas, use LaTeX with $...$ for inline math and $...$ for display math.",
             messages=st.session_state.message_history
         )
         return {
-            "text": response.content[0].text,
+            "text": _extract_text_from_response(response),
             "cost_info": _cost_info_from_response(response),
         }
-    elif st.session_state.model_name in GROK_MODELS.values():
+    elif st.session_state.model_name in OPENAI_COMPATIBLE_MODELS.values():
         if not xai_client:
-            return {"text": "xAI client not initialized. Please check your API key.", "cost_info": None}
-        return _invoke_xai_chat(
+            return {"text": "OpenAI-compatible model client not initialized. Please check the provider API key.", "cost_info": None}
+        return _invoke_openai_compatible_chat(
             xai_client=xai_client,
             system_text="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical formulas, use LaTeX with $...$ for inline math and $...$ for display math.",
             user_text=prompt,
@@ -575,7 +732,7 @@ def find_section_and_respond(anthropic_client, xai_client, simple_prompt, page_n
     # If we get here, we couldn't find a good response
     return "Could not find relevant information in the specified section of the document."
 
-def get_system_response(anthropic_client, xai_client, simple_prompt):
+def get_system_response(anthropic_client, xai_client, simple_prompt, presentation_analysis=False):
     """Get standard response from Claude"""
     st.session_state.message_history.append({"role": 'user', "content": simple_prompt})
     
@@ -588,24 +745,34 @@ def get_system_response(anthropic_client, xai_client, simple_prompt):
             response = anthropic_client.messages.create(
                 model=st.session_state.model_name,
                 max_tokens=2048,
-                temperature=0.75,
                 system="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical formulas, use LaTeX with $...$ for inline math and $...$ for display math.",
                 messages=st.session_state.message_history
             )
-            result = response.content[0].text
+            result = _extract_text_from_response(response)
             st.session_state.last_response_cost = _cost_info_from_response(response)
-        elif st.session_state.model_name in GROK_MODELS.values():
+        elif st.session_state.model_name in OPENAI_COMPATIBLE_MODELS.values():
             if not xai_client:
-                return "xAI client not initialized. Please check your API key."
-            xai_result = _invoke_xai_chat(
+                return "OpenAI-compatible model client not initialized. Please check the provider API key."
+            is_deepseek_presentation = (
+                presentation_analysis
+                and st.session_state.model_name in DEEPSEEK_MODELS.values()
+            )
+            xai_result = _invoke_openai_compatible_chat(
                 xai_client=xai_client,
                 system_text="You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical formulas, use LaTeX with $...$ for inline math and $...$ for display math.",
                 user_text=simple_prompt,
-                max_tokens=2048,
+                max_tokens=8192 if is_deepseek_presentation else 2048,
                 temperature=0.75,
+                disable_deepseek_thinking=is_deepseek_presentation,
             )
             result = xai_result["text"]
             st.session_state.last_response_cost = xai_result["cost_info"]
+            if not result.strip():
+                finish_reason = xai_result.get("finish_reason") or "unknown"
+                result = (
+                    "The selected model returned no visible analysis "
+                    f"(finish reason: {finish_reason}). Try a shorter recording or retry."
+                )
         else:
             return "Selected model not supported."
         
@@ -666,7 +833,13 @@ def get_pdf_summary(anthropic_client, xai_client, start_page, end_page, percenta
     
     st.session_state.message_history.append({"role": 'user', "content": f"Summarize pages {start_page}-{end_page} ({percentage}%) - Dynamic Chunk Size: {CHUNK_SIZE}"})
     
-    system_msg = "You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. When presenting mathematical content, focus on general formulas and symbolic representations rather than specific numerical calculations. Use LaTeX with $...$ for inline math and $$...$$ for display formulas."
+    system_msg = (
+        "You are a university teacher. Express yourself in scientific terms and explain with clarity the concepts. "
+        "When presenting mathematical content, focus on general formulas and symbolic representations rather than specific numerical calculations. "
+        "Use only $...$ for inline math and $$...$$ for display equations. "
+        "Do not use ordinary parentheses or square brackets as math delimiters, keep each equation on one line, "
+        "and ensure superscripts and subscripts are syntactically complete."
+    )
     full_summary = []
     
     progress_bar = st.progress(0)
@@ -685,7 +858,9 @@ def get_pdf_summary(anthropic_client, xai_client, start_page, end_page, percenta
                       f"The summary should be approximately {percentage}% of the original length. "
                       "Focus on keeping the main concepts and skipping irrelevant factual data. "
                       "When encountering formulas or mathematical derivations, ignore specific numerical calculations and instead represent the general formula or symbolic representation. "
-                      "Use LaTeX with $...$ for inline math and $$...$$ for display formulas.\n\n"
+                      "Use only $...$ for inline math and $$...$$ for display equations. "
+                      "Do not use ordinary parentheses or square brackets as math delimiters, keep each equation on one line, "
+                      "and ensure superscripts and subscripts are syntactically complete.\n\n"
                       f"<text>{text_chunk}</text>")
             
             # Determine which client to use
@@ -695,16 +870,15 @@ def get_pdf_summary(anthropic_client, xai_client, start_page, end_page, percenta
                 response = anthropic_client.messages.create(
                     model=st.session_state.model_name,
                     max_tokens=4096,
-                    temperature=0.75,
                     system=system_msg,
                     messages=[{"role": "user", "content": prompt}]
                 )
-                chunk_result = response.content[0].text
+                chunk_result = _extract_text_from_response(response)
                 total_cost_info = _merge_cost_info(total_cost_info, _cost_info_from_response(response))
-            elif st.session_state.model_name in GROK_MODELS.values():
+            elif st.session_state.model_name in OPENAI_COMPATIBLE_MODELS.values():
                 if not xai_client:
-                    return "xAI client not initialized. Please check your API key."
-                xai_result = _invoke_xai_chat(
+                    return "OpenAI-compatible model client not initialized. Please check the provider API key."
+                xai_result = _invoke_openai_compatible_chat(
                     xai_client=xai_client,
                     system_text=system_msg,
                     user_text=prompt,
@@ -870,16 +1044,15 @@ def get_pdf_formula_summary(anthropic_client, xai_client, start_page, end_page):
                 response = anthropic_client.messages.create(
                     model=st.session_state.model_name,
                     max_tokens=1200,
-                    temperature=0.2,
                     system=system_msg,
                     messages=[{"role": "user", "content": prompt}],
                 )
-                chunk_result = response.content[0].text
+                chunk_result = _extract_text_from_response(response)
                 total_cost_info = _merge_cost_info(total_cost_info, _cost_info_from_response(response))
-            elif st.session_state.model_name in GROK_MODELS.values():
+            elif st.session_state.model_name in OPENAI_COMPATIBLE_MODELS.values():
                 if not xai_client:
-                    return "xAI client not initialized. Please check your API key."
-                xai_result = _invoke_xai_chat(
+                    return "OpenAI-compatible model client not initialized. Please check the provider API key."
+                xai_result = _invoke_openai_compatible_chat(
                     xai_client=xai_client,
                     system_text=system_msg,
                     user_text=prompt,
@@ -1257,8 +1430,10 @@ with st.sidebar:
             st.caption("Selected model provider: Anthropic")
         elif selected_model in GROK_MODELS:
             st.caption("Selected model provider: xAI (Grok)")
+        elif selected_model in DEEPSEEK_MODELS:
+            st.caption("Selected model provider: DeepSeek")
 
-        col_clear_a, col_clear_b = st.columns(2)
+        col_clear_a, col_clear_b, col_clear_c = st.columns(3)
         with col_clear_a:
             if st.button("Clear Anthropic Key"):
                 st.session_state.anthropic_api_key = ""
@@ -1268,6 +1443,11 @@ with st.sidebar:
             if st.button("Clear xAI Key"):
                 st.session_state.xai_api_key = ""
                 st.success("xAI API key cleared for this session.")
+                st.rerun()
+        with col_clear_c:
+            if st.button("Clear DeepSeek Key"):
+                st.session_state.deepseek_api_key = ""
+                st.success("DeepSeek API key cleared for this session.")
                 st.rerun()
 
         st.divider()
@@ -1366,6 +1546,22 @@ with st.sidebar:
             else:
                 st.success("xAI API key is set.")
 
+        if selected_model in DEEPSEEK_MODELS:
+            if not st.session_state.get("deepseek_api_key"):
+                st.info("DeepSeek API key required for selected model")
+                deepseek_key_input = st.text_input(
+                    "Enter your DeepSeek API Key",
+                    type="password",
+                    key="deepseek_api_key_input",
+                    help="Create an API key in the DeepSeek API platform.",
+                )
+                if deepseek_key_input:
+                    st.session_state.deepseek_api_key = deepseek_key_input
+                    st.success("DeepSeek API Key set for this session.")
+                    st.rerun()
+            else:
+                st.success("DeepSeek API key is set.")
+
     with tab_pdf:
         # PDF Upload
         st.subheader("PDF Upload")
@@ -1399,10 +1595,15 @@ with st.sidebar:
         st.subheader("Conversation History")
         if st.session_state.message_history:
             for i, msg in enumerate(st.session_state.message_history[-10:]):  # Show last 10 messages
-                role = "👤 You" if msg["role"] == "user" else "🤖 Claude"
+                role = "👤 You" if msg["role"] == "user" else "🤖 Assistant"
                 st.text(f"{role}: {msg['content'][:50]}...")
 
     with tab_guide:
+        st.markdown(
+            "**Contact**  \n"
+            "Email: [asianbets@zoho.eu](mailto:asianbets@zoho.eu)  \n"
+            "X: [@betterstudix](https://x.com/betterstudix)"
+        )
         st.header("User Guide")
         st.markdown(
             """
@@ -1410,7 +1611,7 @@ This app helps you chat with AI, analyze PDFs, process audio, summarize document
 
 **Setup**
 - Select an AI model in the Settings tab.
-- Enter your own Anthropic or xAI API key in the Settings tab.
+- Enter your own Anthropic, xAI, or DeepSeek API key in the Settings tab.
 - Upload a PDF in the PDF tab before using PDF-based modes.
 
 **Access**
@@ -1474,6 +1675,10 @@ elif selected_model_name in GROK_MODELS:
     if not st.session_state.get("xai_api_key"):
         can_proceed = False
         error_message = "Please enter an xAI API key in the sidebar to use the selected model."
+elif selected_model_name in DEEPSEEK_MODELS:
+    if not st.session_state.get("deepseek_api_key"):
+        can_proceed = False
+        error_message = "Please enter a DeepSeek API key in the sidebar to use the selected model."
 
 if not can_proceed:
     st.error(error_message)
@@ -1487,7 +1692,7 @@ else:
         except Exception as e:
             st.error(f"Failed to initialize Anthropic client. Please check your API key. Error: {e}")
 
-    if st.session_state.get("xai_api_key"):
+    if selected_model_name in GROK_MODELS and st.session_state.get("xai_api_key"):
         try:
             xai_client = ChatOpenAI(
                 openai_api_key=st.session_state.xai_api_key,
@@ -1496,6 +1701,16 @@ else:
             )
         except Exception as e:
             st.error(f"Failed to initialize xAI client. Please check your API key. Error: {e}")
+
+    elif selected_model_name in DEEPSEEK_MODELS and st.session_state.get("deepseek_api_key"):
+        try:
+            xai_client = ChatOpenAI(
+                openai_api_key=st.session_state.deepseek_api_key,
+                openai_api_base="https://api.deepseek.com",
+                model=st.session_state.model_name,
+            )
+        except Exception as e:
+            st.error(f"Failed to initialize DeepSeek client. Please check your API key. Error: {e}")
 
     if anthropic_client or xai_client:
         # Mode selection
@@ -1782,7 +1997,12 @@ else:
                     
                     with st.spinner("AI is analyzing the content..."):
                         lp = get_long_prompt(transcription_text)
-                        system_response = get_system_response(anthropic_client, xai_client, lp)
+                        system_response = get_system_response(
+                            anthropic_client,
+                            xai_client,
+                            lp,
+                            presentation_analysis=True,
+                        )
                     
                     # Save the analysis to HTML
                     html_file = save_to_html(system_response)
